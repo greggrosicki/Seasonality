@@ -1,0 +1,4434 @@
+---
+title: "Seasonality_11_June_2026"
+output: html_document
+date: "2026-June-11"
+---
+
+### Import libraries
+```{r}
+library(haven)
+library(ggplot2)
+library(ggfortify)
+library(lubridate)
+library(dplyr)
+library(ggbeeswarm)
+library(lme4) 
+library(lmerTest)
+library(car)
+library(ggpubr)
+library(emmeans)
+library(sjstats)
+library(mgcv)
+library(tidyr)
+library(visreg)
+library(itsadug)
+library(gratia)
+library(readr)
+library(glue)
+library(purrr)
+library(scales)
+library(stringr)
+library(metR)
+library(broom)
+library(hms)
+library(ggpattern)
+library(patchwork)
+library(ggpp)
+library(ggsignif)
+
+# ---- Cyclic spline knots: enforce a true 12-month period ----
+# With bs="cc" and MONTH_NUM in 1:12, the default knot placement ties
+# month 1 == month 12, giving an 11-month cycle that forces Dec == Jan and
+# distorts the December peak and every seasonal amplitude. Boundary knots at
+# 0.5 and 12.5 give a proper 12-month period (Dec -> Jan is one step).
+# Passed via `knots = MONTH_KNOTS` to every bam()/gam() with a MONTH_NUM cyclic smooth.
+MONTH_KNOTS <- list(MONTH_NUM = c(0.5, 12.5))
+```
+
+### Read in data
+```{r}
+# Use cached RDS if available; otherwise read CSV and cache
+data_rds <- "/Users/gregory.grosicki/Desktop/Seasonality/Seasonality_npjDig/Seasonality_Pull_22_Apr_2026.rds"
+data_csv <- "/Users/gregory.grosicki/Desktop/Seasonality/Seasonality_npjDig/Seasonality_Pull_22_Apr_2026.csv"
+
+if (file.exists(data_rds)) {
+  df <- readRDS(data_rds)
+} else {
+  df <- read.csv(data_csv)
+  saveRDS(df, data_rds)
+}
+
+# Create field for BMI
+df <- df %>%
+  mutate(BMI = WEIGHT / (HEIGHT^2))
+
+# Create field for SHRZS
+df <- df %>%
+  mutate(
+    SHRZS = TOTAL_ZONE1_MIN * 1 +
+            TOTAL_ZONE2_MIN * 2 +
+            TOTAL_ZONE3_MIN * 3 +
+            TOTAL_ZONE4_MIN * 4 +
+            TOTAL_ZONE5_MIN * 5
+  )
+df <- df %>%
+  mutate(SHRZS = ifelse(is.na(SHRZS), 0, SHRZS))
+```
+
+### Setup: Color palettes, theme, and helper functions
+```{r}
+# ---- Color palettes ----
+age_colors <- c("Young" = "#66c2a5", "Middle" = "#fc8d62", "Old" = "#8da0cb")
+gender_colors <- c("male" = "#1f78b4", "female" = "#f781bf")
+gender_labels <- c("male" = "Male", "female" = "Female")
+pa_colors <- c("Low" = "#e41a1c", "Moderate" = "#377eb8", "High" = "#4daf4a")
+bmi_colors <- c("Normal" = "#4daf4a", "Overweight" = "#377eb8", "Obese" = "#e41a1c")
+
+# ---- Custom theme ----
+theme_seasonality <- function(legend = TRUE) {
+  t <- theme_minimal(base_size = 14) +
+    theme(
+      axis.line = element_line(color = "black", linewidth = 0.8),
+      axis.text = element_text(color = "black", face = "bold"),
+      axis.title = element_text(color = "black", face = "bold"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title = element_blank(),
+      panel.border = element_blank()
+    )
+  if (!legend) {
+    t <- t + theme(legend.position = "none")
+  } else {
+    t <- t + theme(
+      legend.title = element_text(color = "black", face = "bold"),
+      legend.text = element_text(color = "black", face = "bold")
+    )
+  }
+  t
+}
+
+# ---- Bootstrap: participant-level resampling ----
+
+# Single or grouped amplitude bootstrap
+bootstrap_amplitude <- function(data, formula, by = NULL, B = 1000, seed = 2024) {
+  set.seed(seed)
+  user_ids <- unique(data$USER_ID)
+  n_users <- length(user_ids)
+  results <- vector("list", B)
+
+  for (i in 1:B) {
+    boot_ids <- sample(user_ids, n_users, replace = TRUE)
+    boot_data <- tibble(.boot_user = seq_along(boot_ids), USER_ID = boot_ids) %>%
+      left_join(data, by = "USER_ID", relationship = "many-to-many")
+
+    boot_model <- tryCatch(
+      suppressMessages(bam(formula, data = boot_data, method = "fREML", knots = MONTH_KNOTS, discrete = TRUE)),
+      error = function(e) NULL
+    )
+
+    if (is.null(boot_model)) next
+
+    if (!is.null(by)) {
+      v <- tryCatch(
+        visreg(boot_model, xvar = "MONTH_NUM", by = by, overlay = TRUE,
+               partial = FALSE, rug = FALSE, plot = FALSE),
+        error = function(e) NULL
+      )
+      if (!is.null(v)) {
+        results[[i]] <- v$fit %>%
+          group_by(across(all_of(by))) %>%
+          summarise(amplitude = max(visregFit, na.rm = TRUE) - min(visregFit, na.rm = TRUE),
+                    .groups = "drop")
+      }
+    } else {
+      v <- tryCatch(
+        visreg(boot_model, xvar = "MONTH_NUM", partial = FALSE, rug = FALSE, plot = FALSE),
+        error = function(e) NULL
+      )
+      if (!is.null(v)) {
+        results[[i]] <- tibble(amplitude = max(v$fit$visregFit, na.rm = TRUE) -
+                                           min(v$fit$visregFit, na.rm = TRUE))
+      }
+    }
+
+    if (i %% 50 == 0) cat("Completed", i, "bootstraps\n")
+  }
+
+  bind_rows(results, .id = "iteration")
+}
+
+# Paired attenuation bootstrap (baseline vs adjusted)
+bootstrap_attenuation <- function(data, formula_base, formula_adj, B = 1000, seed = 2024) {
+  set.seed(seed)
+  user_ids <- unique(data$USER_ID)
+  n_users <- length(user_ids)
+  amp_base <- rep(NA_real_, B)
+  amp_adj  <- rep(NA_real_, B)
+
+  for (i in 1:B) {
+    boot_ids <- sample(user_ids, n_users, replace = TRUE)
+    boot_data <- tibble(.boot_user = seq_along(boot_ids), USER_ID = boot_ids) %>%
+      left_join(data, by = "USER_ID", relationship = "many-to-many")
+
+    model_b <- tryCatch(
+      bam(formula_base, data = boot_data, method = "fREML", knots = MONTH_KNOTS, discrete = TRUE),
+      error = function(e) NULL
+    )
+    model_a <- tryCatch(
+      bam(formula_adj, data = boot_data, method = "fREML", knots = MONTH_KNOTS, discrete = TRUE),
+      error = function(e) NULL
+    )
+
+    if (!is.null(model_b) && !is.null(model_a)) {
+      vis_b <- tryCatch(visreg(model_b, xvar = "MONTH_NUM", partial = FALSE, rug = FALSE, plot = FALSE), error = function(e) NULL)
+      vis_a <- tryCatch(visreg(model_a, xvar = "MONTH_NUM", partial = FALSE, rug = FALSE, plot = FALSE), error = function(e) NULL)
+
+      if (!is.null(vis_b) && !is.null(vis_a)) {
+        amp_base[i] <- max(vis_b$fit$visregFit, na.rm = TRUE) - min(vis_b$fit$visregFit, na.rm = TRUE)
+        amp_adj[i]  <- max(vis_a$fit$visregFit, na.rm = TRUE) - min(vis_a$fit$visregFit, na.rm = TRUE)
+      }
+    }
+
+    if (i %% 50 == 0) cat("Completed", i, "bootstraps\n")
+  }
+
+  valid <- !is.na(amp_base) & !is.na(amp_adj)
+
+  list(amp_base = amp_base[valid], amp_adj = amp_adj[valid], n_valid = sum(valid))
+}
+
+# Summary helper for attenuation results
+summarize_attenuation <- function(att) {
+  mean_base <- mean(att$amp_base)
+  mean_adj  <- mean(att$amp_adj)
+  mean_diff <- mean_base - mean_adj
+  pct_att   <- (mean_diff / mean_base) * 100
+  amp_diff  <- att$amp_base - att$amp_adj
+
+  ci_base <- quantile(att$amp_base, c(0.025, 0.975))
+  ci_adj  <- quantile(att$amp_adj, c(0.025, 0.975))
+  ci_diff <- quantile(amp_diff, c(0.025, 0.975))
+
+  # Bootstrap CI for percent attenuation (paired-resample distribution)
+  pct_vec <- (att$amp_base - att$amp_adj) / att$amp_base * 100
+  ci_pct  <- quantile(pct_vec, c(0.025, 0.975))
+
+  t_result <- t.test(att$amp_base, att$amp_adj, paired = TRUE)
+
+  cat("Mean Amplitude (Baseline):", round(mean_base, 3), "\n")
+  cat("95% CI (Baseline):", round(ci_base[1], 3), "-", round(ci_base[2], 3), "\n\n")
+  cat("Mean Amplitude (Adjusted):", round(mean_adj, 3), "\n")
+  cat("95% CI (Adjusted):", round(ci_adj[1], 3), "-", round(ci_adj[2], 3), "\n\n")
+  cat("Mean Difference:", round(mean_diff, 3), "\n")
+  cat("95% CI for Difference:", round(ci_diff[1], 3), "-", round(ci_diff[2], 3), "\n\n")
+  cat("Percent Attenuation:", round(pct_att, 1), "%\n")
+  cat("95% CI for Percent Attenuation:", round(ci_pct[1], 1), "-", round(ci_pct[2], 1), "%\n\n")
+  cat("Paired t-test p-value:", signif(t_result$p.value, 5), "\n")
+
+  invisible(list(
+    mean_base = mean_base, mean_adj = mean_adj,
+    ci_base = ci_base, ci_adj = ci_adj,
+    mean_diff = mean_diff, ci_diff = ci_diff,
+    pct_attenuation = pct_att, ci_pct = ci_pct,
+    t_test = t_result
+  ))
+}
+
+# Marginal-trajectory prediction helper (lpmatrix-based)
+# Computes the marginal seasonal curve averaged over factor covariates (e.g.,
+# GENDER) using the proper quadratic form x'Vx for SEs. Averaging predicted
+# variances across correlated predictions (as the prior version did) ignores
+# Cov(p_i, p_j) and underestimates the marginal SE because predictions sharing
+# fitted coefficients are highly correlated.
+# Uses vcov(model, unconditional = TRUE) so CIs incorporate smoothing-parameter
+# uncertainty (Bayesian credible interval; Marra & Wood 2012, Scand J Stat).
+# Returns columns (MONTH_NUM, <by_var>, visregFit, visregLwr, visregUpr) — same
+# shape as visreg's $fit, so downstream ggplot code is unchanged.
+predict_marginal_trajectory <- function(model, data, by_var = NULL,
+                                        exclude_re = NULL,
+                                        month_grid = seq(1, 12, length.out = 200)) {
+  pred_vars <- all.vars(delete.response(terms(model)))
+  factor_marginalize <- intersect(pred_vars, c("GENDER")) |> setdiff(by_var)
+  continuous <- setdiff(pred_vars, c("MONTH_NUM", by_var, "USER_ID", factor_marginalize))
+
+  grid_args <- list(MONTH_NUM = month_grid)
+  if (!is.null(by_var)) grid_args[[by_var]] <- levels(data[[by_var]])
+  for (f in factor_marginalize) grid_args[[f]] <- levels(data[[f]])
+  grid <- do.call(expand.grid, grid_args) |> as_tibble()
+
+  for (v in continuous) grid[[v]] <- mean(data[[v]], na.rm = TRUE)
+  if ("USER_ID" %in% pred_vars) grid$USER_ID <- data$USER_ID[1]
+
+  # Design matrix on link scale; `exclude` zeros out columns of excluded smooths
+  # (e.g. the s(USER_ID) random effect) so predictions are population-level.
+  pred_args <- list(model, newdata = grid, type = "lpmatrix")
+  if (!is.null(exclude_re)) pred_args$exclude <- exclude_re
+  X <- do.call(predict, pred_args)
+
+  V    <- vcov(model, unconditional = TRUE)
+  beta <- coef(model)
+
+  # Average X rows within each (MONTH_NUM, by_var) cell. The marginal
+  # prediction is then x_bar' beta and its SE is sqrt(x_bar' V x_bar),
+  # which correctly accounts for shared coefficient uncertainty across
+  # the marginalised factor levels.
+  key_cols <- c("MONTH_NUM", by_var)
+  cell_id <- do.call(paste, c(as.list(grid[key_cols]), sep = ""))
+  unique_cells <- unique(cell_id)
+  keys_out <- grid[match(unique_cells, cell_id), key_cols, drop = FALSE] |> as_tibble()
+
+  X_bar <- t(vapply(unique_cells,
+                    function(k) colMeans(X[cell_id == k, , drop = FALSE]),
+                    numeric(ncol(X))))
+
+  fit <- as.numeric(X_bar %*% beta)
+  se  <- sqrt(rowSums((X_bar %*% V) * X_bar))
+
+  keys_out %>%
+    mutate(
+      visregFit = fit,
+      se_avg    = se,
+      visregLwr = visregFit - 1.96 * se,
+      visregUpr = visregFit + 1.96 * se
+    )
+}
+
+# Marginal-mean + pairwise-contrast helper (lpmatrix-based)
+# Replaces the manual emm_manual + compute_all_contrasts pattern in the GAMM
+# Aim 1 sections. Marginal means are computed at each (by_var, MONTH_NUM)
+# cell averaging over GENDER (when GENDER is not the by_var); pairwise contrasts
+# use c = X_bar_i - X_bar_j with SE = sqrt(c' V c) so the cell covariance is
+# properly accounted for. Holm-adjusted across all contrasts. Uses
+# vcov(model, unconditional = TRUE) for Bayesian credible intervals.
+# Note: contrast direction follows factor level order in `data[[by_var]]`.
+# For AGE_BUCKET this gives Young-Middle, Young-Old, Middle-Old (Y/M/O level
+# order set explicitly upstream). For GENDER it follows alphabetical order
+# (female - male), so signed estimates differ from prior manual versions but
+# magnitudes, p-values, and CIs are identical.
+emmeans_contrasts_lpmatrix <- function(model, data, by_var, months = c(8, 12),
+                                       exclude_re = "s(USER_ID)") {
+  pred_vars <- all.vars(delete.response(terms(model)))
+  factor_marginalize <- intersect(pred_vars, c("GENDER")) |> setdiff(by_var)
+  continuous <- setdiff(pred_vars, c("MONTH_NUM", by_var, "USER_ID", factor_marginalize))
+
+  grid_args <- list(MONTH_NUM = months)
+  grid_args[[by_var]] <- levels(data[[by_var]])
+  for (f in factor_marginalize) grid_args[[f]] <- levels(data[[f]])
+  grid <- do.call(expand.grid, grid_args) |> as_tibble()
+
+  for (v in continuous) grid[[v]] <- mean(data[[v]], na.rm = TRUE)
+  if ("USER_ID" %in% pred_vars) grid$USER_ID <- data$USER_ID[1]
+
+  X    <- predict(model, newdata = grid, type = "lpmatrix", exclude = exclude_re)
+  V    <- vcov(model, unconditional = TRUE)
+  beta <- coef(model)
+
+  cell_id <- do.call(paste, c(as.list(grid[c(by_var, "MONTH_NUM")]), sep = ""))
+  unique_cells <- unique(cell_id)
+  cell_meta <- grid[match(unique_cells, cell_id),
+                    c(by_var, "MONTH_NUM"), drop = FALSE] |> as_tibble()
+  X_bar <- t(vapply(unique_cells,
+                    function(k) colMeans(X[cell_id == k, , drop = FALSE]),
+                    numeric(ncol(X))))
+
+  emm <- bind_cols(cell_meta, tibble(emmean = as.numeric(X_bar %*% beta)))
+
+  groups <- levels(data[[by_var]])
+  pairs  <- combn(groups, 2, simplify = FALSE)
+  df_resid <- df.residual(model)
+
+  contrast_rows <- list()
+  for (m in months) {
+    for (pair in pairs) {
+      i <- which(cell_meta[[by_var]] == pair[1] & cell_meta$MONTH_NUM == m)
+      j <- which(cell_meta[[by_var]] == pair[2] & cell_meta$MONTH_NUM == m)
+      c_vec <- X_bar[i, ] - X_bar[j, ]
+      contrast_rows[[length(contrast_rows) + 1]] <- tibble(
+        MONTH_NUM = m,
+        contrast  = paste(pair[1], "-", pair[2]),
+        estimate  = as.numeric(c_vec %*% beta),
+        SE        = sqrt(as.numeric(crossprod(c_vec, V %*% c_vec))),
+        df        = df_resid
+      )
+    }
+  }
+
+  contrasts_df <- bind_rows(contrast_rows) %>%
+    mutate(
+      t.ratio  = estimate / SE,
+      p.unadj  = 2 * pt(-abs(t.ratio), df = df),
+      p.value  = p.adjust(p.unadj, method = "holm"),
+      lower.CL = estimate - qt(0.975, df = df) * SE,
+      upper.CL = estimate + qt(0.975, df = df) * SE
+    ) %>%
+    mutate(across(c(estimate, SE, t.ratio, p.unadj, p.value, lower.CL, upper.CL),
+                  ~ round(.x, 3)))
+
+  list(emm = emm, contrasts = contrasts_df)
+}
+
+# Pairwise bootstrap comparison helper
+bootstrap_pairwise <- function(boot_df, group_var) {
+  amp_wide <- boot_df %>%
+    pivot_wider(names_from = all_of(group_var), values_from = amplitude) %>%
+    na.omit()
+
+  groups <- unique(boot_df[[group_var]])
+  B <- nrow(amp_wide)
+
+  pairs <- combn(groups, 2, simplify = FALSE)
+
+  map_df(pairs, function(pair) {
+    diff_vec <- amp_wide[[pair[2]]] - amp_wide[[pair[1]]]
+    flips <- min(sum(diff_vec > 0), sum(diff_vec < 0))
+    p_val <- if (flips == 0) {
+      paste0("< ", formatC(2 / B, format = "f", digits = 3))
+    } else {
+      as.character(round(2 * flips / B, 3))
+    }
+    tibble(comparison = paste(pair[2], "vs", pair[1]), p_value = p_val)
+  })
+}
+
+# ---- Inset-annotation helpers (Fig 1, 2, 3 D-I, 4, S2/S3 A&C, S6-S9) ----
+
+# Format bootstrap p-value: pass through "< ..." strings as-is, prefix "= "
+# to numeric strings. Input is the character p_value column from bootstrap_pairwise.
+fmt_boot_p <- function(p) {
+  ifelse(grepl("<", p), p, paste0("= ", p))
+}
+
+# Format numeric p-value (e.g. paired-t p from summarize_attenuation): "< 0.001"
+# below threshold, "= 0.0XX" otherwise.
+fmt_num_p <- function(p) {
+  ifelse(p < 0.001, "< 0.001", sprintf("= %.3f", p))
+}
+
+# Build multi-line inset string for amplitude figures: group rows with bootstrap
+# amplitude (95% CI) followed by pairwise p-values from bootstrap_pairwise.
+# Headers in UPPERCASE for visual distinction (richtext/bold avoided to skip
+# the gridtext dependency chain).
+make_amp_inset <- function(amp_df, pval_df, by_var, group_levels = NULL) {
+  if (!is.null(group_levels)) {
+    amp_df <- amp_df[order(match(amp_df[[by_var]], group_levels)), ]
+  }
+  amp_lines <- sprintf("%s: %.2f (%.2f, %.2f)",
+                       amp_df[[by_var]], amp_df$mean_amp,
+                       amp_df$ci_low, amp_df$ci_high)
+  pval_lines <- sprintf("%s: p %s", pval_df$comparison, fmt_boot_p(pval_df$p_value))
+  paste(c("AMPLITUDE (95% CI)", amp_lines, "",
+          "PAIRWISE P-VALUES", pval_lines),
+        collapse = "\n")
+}
+
+# Build one-line inset string for attenuation figures (Fig 3 D-I).
+make_att_inset <- function(att_summary) {
+  sprintf("Attenuation: %.1f%% (%.1f, %.1f); p %s",
+          att_summary$pct_attenuation,
+          att_summary$ci_pct[1], att_summary$ci_pct[2],
+          fmt_num_p(att_summary$t_test$p.value))
+}
+
+# Layer wrappers: drop into ggplot pipelines via `p + amp_inset_layer(...)`.
+# Insets render in the right margin under the legend (npcx > 1, clip = "off").
+# Each helper returns a list containing the geom + a coord_cartesian(clip = "off")
+# + theme adjustments (legend anchored to top of right margin, plot margin bumped
+# to make room). The helper assumes the underlying plot has no prior coord_*().
+amp_inset_layer <- function(amp_df, pval_df, by_var, group_levels = NULL,
+                             npcx = 1.02, npcy = 0.45, size = 2.7,
+                             margin_r = 110) {
+  list(
+    ggpp::geom_label_npc(
+      data = tibble(npcx = npcx, npcy = npcy,
+                    label = make_amp_inset(amp_df, pval_df, by_var, group_levels)),
+      aes(npcx = npcx, npcy = npcy, label = label),
+      hjust = 0, vjust = 1, size = size, color = "black",
+      label.size = 0.3, fill = scales::alpha("white", 0.85),
+      label.padding = unit(0.3, "lines"), inherit.aes = FALSE
+    ),
+    coord_cartesian(clip = "off"),
+    theme(plot.margin = margin(t = 5, r = margin_r, b = 5, l = 5),
+          legend.justification = c("left", "top"))
+  )
+}
+
+att_inset_layer <- function(att_summary, npcx = 1.02, npcy = 0.35, size = 3,
+                             margin_r = 110) {
+  list(
+    ggpp::geom_label_npc(
+      data = tibble(npcx = npcx, npcy = npcy, label = make_att_inset(att_summary)),
+      aes(npcx = npcx, npcy = npcy, label = label),
+      hjust = 0, vjust = 1, size = size, color = "black",
+      label.size = 0.3, fill = scales::alpha("white", 0.85),
+      label.padding = unit(0.3, "lines"), inherit.aes = FALSE
+    ),
+    coord_cartesian(clip = "off"),
+    theme(plot.margin = margin(t = 5, r = margin_r, b = 5, l = 5),
+          legend.justification = c("left", "top"))
+  )
+}
+
+# Bracket annotations on violin/box panels (Fig 1 B&D, Fig 2 B&D, Supp S2/S3 B&D)
+# Uses pre-computed Tukey-adjusted p-values from emmeans `pairs()` rather than
+# letting ggsignif run its own (unadjusted) test. step_increase auto-stacks
+# brackets vertically; expand the panel ylim to leave headroom.
+fmt_p_label <- function(p) {
+  ifelse(p < 0.001, "p < 0.001", sprintf("p = %.3f", p))
+}
+
+# Inset for GAMM panels (Supp Fig S2/S3 A&C): point-estimate amplitudes (no CI)
+# + 2-column compact Aug | Dec p-values from emmeans_contrasts_lpmatrix output.
+# Headers in UPPERCASE for visual distinction.
+make_gamm_inset <- function(amp_df, contrasts_df, by_var, group_levels = NULL) {
+  if (!is.null(group_levels)) {
+    amp_df <- amp_df[order(match(amp_df[[by_var]], group_levels)), ]
+  }
+  amp_lines <- sprintf("%s: %.2f", amp_df[[by_var]], amp_df$amplitude)
+
+  cw <- contrasts_df %>%
+    select(contrast, MONTH_NUM, p.value) %>%
+    tidyr::pivot_wider(names_from = MONTH_NUM, values_from = p.value)
+
+  fmt_p_compact <- function(p) ifelse(p < 0.001, "<.001", sprintf(".%03d", round(p * 1000)))
+  pval_lines <- sprintf("%s: %s | %s", cw$contrast,
+                        fmt_p_compact(cw$`8`), fmt_p_compact(cw$`12`))
+
+  paste(c("AMPLITUDE (GAMM)", amp_lines, "",
+          "AUG | DEC P-VALUES", pval_lines), collapse = "\n")
+}
+
+gamm_inset_layer <- function(amp_df, contrasts_df, by_var, group_levels = NULL,
+                              npcx = 1.02, npcy = 0.45, size = 2.7,
+                              margin_r = 110) {
+  list(
+    ggpp::geom_label_npc(
+      data = tibble(npcx = npcx, npcy = npcy,
+                    label = make_gamm_inset(amp_df, contrasts_df, by_var, group_levels)),
+      aes(npcx = npcx, npcy = npcy, label = label),
+      hjust = 0, vjust = 1, size = size, color = "black",
+      label.size = 0.3, fill = scales::alpha("white", 0.85),
+      label.padding = unit(0.3, "lines"), inherit.aes = FALSE
+    ),
+    coord_cartesian(clip = "off"),
+    theme(plot.margin = margin(t = 5, r = margin_r, b = 5, l = 5),
+          legend.justification = c("left", "top"))
+  )
+}
+
+# Aug→Dec within-group brackets + interaction-p subtitle for Supp S2/S3 B&D.
+# Reads Holm-adjusted contrasts from emmeans(model, pairwise ~ MONTH_LABEL | by_var).
+# Bracket spans the two dodged box positions for each group (dodge_width/4 from
+# center). Interaction p comes from anova(model) at the by_var:MONTH_LABEL row
+# (lmerTest gives Satterthwaite-df F-test p-values).
+aug_dec_brackets_layer <- function(model, data, y_var, by_var, group_levels,
+                                   interaction_term, by_label,
+                                   dodge_width = 0.75, textsize = 3) {
+  emm_within <- emmeans::emmeans(model,
+                                 as.formula(paste("pairwise ~ MONTH_LABEL |", by_var)),
+                                 adjust = "holm")
+  cw <- as.data.frame(emm_within$contrasts)
+  cw <- cw[match(group_levels, cw[[by_var]]), ]
+
+  n_groups <- length(group_levels)
+  half_dodge <- dodge_width / 4
+  xmin <- seq_len(n_groups) - half_dodge
+  xmax <- seq_len(n_groups) + half_dodge
+
+  # 99th percentile keeps brackets just above the whiskers even when extreme
+  # outliers sit outside coord_cartesian's ylim (which would clip the brackets).
+  y_max <- quantile(data[[y_var]], 0.99, na.rm = TRUE)
+  y_pos <- rep(y_max * 1.04, n_groups)
+
+  int_p <- anova(model)[interaction_term, "Pr(>F)"]
+  int_label <- sprintf("%s × Month: %s", by_label, fmt_p_label(int_p))
+
+  list(
+    ggsignif::geom_signif(
+      annotations = fmt_p_label(cw$p.value),
+      xmin = xmin, xmax = xmax,
+      y_position = y_pos,
+      tip_length = 0.01, textsize = textsize, vjust = -0.2
+    ),
+    labs(subtitle = int_label),
+    theme(plot.subtitle = element_text(face = "bold", color = "black", hjust = 0.5))
+  )
+}
+
+# One-line β annotation for Figure S5 (geographic daylight regression).
+# Sources values from daylight_results_cluster (cluster-robust SEs by state).
+beta_inset_layer <- function(daylight_df, outcome, unit,
+                             npcx = 1.02, npcy = 0.35, size = 3,
+                             margin_r = 130) {
+  r <- daylight_df[daylight_df$Outcome == outcome, , drop = FALSE]
+  p_str <- if (r$p_value < 0.001) "< 0.001" else sprintf("= %.3f", r$p_value)
+  label <- sprintf("β = %.3f %s (95%% CI: %.3f, %.3f); p %s",
+                   r$beta_daylight, unit, r$ci_low, r$ci_high, p_str)
+  list(
+    ggpp::geom_label_npc(
+      data = tibble(npcx = npcx, npcy = npcy, label = label),
+      aes(npcx = npcx, npcy = npcy, label = label),
+      hjust = 0, vjust = 1, size = size, color = "black",
+      label.size = 0.3, fill = scales::alpha("white", 0.85),
+      label.padding = unit(0.3, "lines"), inherit.aes = FALSE
+    ),
+    coord_cartesian(clip = "off"),
+    theme(plot.margin = margin(t = 5, r = margin_r, b = 5, l = 5),
+          legend.justification = c("left", "top"))
+  )
+}
+
+violin_brackets_layer <- function(tukey_obj, comparisons, group_levels,
+                                  y_positions, tip_length = 0.4,
+                                  textsize = 3, linewidth = 0.4) {
+  # Manual brackets via geom_segment + geom_text. Replaces a prior ggsignif
+  # implementation (broken under ggplot2 4.x as of ggsignif 0.6.4). Caller
+  # supplies group_levels (factor order on x-axis) and y_positions (one per
+  # comparison, in data units of the y-axis).
+  td <- as.data.frame(tukey_obj)
+  contrasts_str <- as.character(td$contrast)
+  pair_keys <- vapply(strsplit(contrasts_str, " - ", fixed = TRUE),
+                      function(x) paste(sort(x), collapse = "|"),
+                      character(1))
+  p_lookup <- setNames(td$p.value, pair_keys)
+
+  brackets <- do.call(rbind, lapply(seq_along(comparisons), function(i) {
+    comp <- comparisons[[i]]
+    key <- paste(sort(comp), collapse = "|")
+    p <- p_lookup[[key]]
+    label <- if (is.null(p) || is.na(p)) "p = ?" else fmt_p_label(p)
+    data.frame(
+      x1 = match(comp[1], group_levels),
+      x2 = match(comp[2], group_levels),
+      y  = y_positions[i],
+      label = label,
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  list(
+    # Horizontal bracket bar
+    geom_segment(data = brackets,
+                 aes(x = x1, xend = x2, y = y, yend = y),
+                 linewidth = linewidth, inherit.aes = FALSE),
+    # Left tip (down-pointing)
+    geom_segment(data = brackets,
+                 aes(x = x1, xend = x1, y = y - tip_length, yend = y),
+                 linewidth = linewidth, inherit.aes = FALSE),
+    # Right tip (down-pointing)
+    geom_segment(data = brackets,
+                 aes(x = x2, xend = x2, y = y - tip_length, yend = y),
+                 linewidth = linewidth, inherit.aes = FALSE),
+    # Label above bar
+    geom_text(data = brackets,
+              aes(x = (x1 + x2) / 2, y = y + tip_length * 0.5, label = label),
+              size = textsize, vjust = 0, inherit.aes = FALSE)
+  )
+}
+```
+
+### Make monthly dataframe
+```{r}
+df <- df %>%
+  mutate(
+    LOWER_DAYS = as.Date(LOWER_DAYS),
+    MONTH = floor_date(LOWER_DAYS, "month")
+  )
+
+df_month <- df %>%
+  group_by(USER_ID, MONTH) %>%
+  summarise(
+    RESTING_HEART_RATE = mean(RESTING_HEART_RATE, na.rm = TRUE),
+    HRV = mean(HRV, na.rm = TRUE),
+    SHRZS = mean(SHRZS, na.rm = TRUE),
+    MINUTES_OF_SLEEP = mean(MINUTES_OF_SLEEP, na.rm = TRUE),
+
+    # Static user fields
+    STRAP_GENERATION = first(na.omit(STRAP_GENERATION)),
+    HEIGHT = first(na.omit(HEIGHT)),
+    WEIGHT = first(na.omit(WEIGHT)),
+    GENDER = first(na.omit(GENDER)),
+    BMI = first(na.omit(BMI)),
+    AGE_2023 = first(na.omit(AGE_2023)),
+    AGE_BUCKET = first(na.omit(AGE_BUCKET)),
+    STATE = first(na.omit(STATE)),
+    .groups = 'drop'
+  )
+
+df_month <- df_month %>%
+  group_by(USER_ID) %>%
+  mutate(
+    # Person-level mean (between-person)
+    SHRZS_b = mean(SHRZS, na.rm = TRUE),
+    MINUTES_OF_SLEEP_b = mean(MINUTES_OF_SLEEP, na.rm = TRUE),
+
+    # Person-mean centered (within-person)
+    SHRZS_w = SHRZS - SHRZS_b,
+    MINUTES_OF_SLEEP_w = MINUTES_OF_SLEEP - MINUTES_OF_SLEEP_b
+  ) %>%
+  ungroup()
+```
+
+### Compute some descriptive stats
+```{r}
+# Compute some descriptive stats
+df_person <- df_month %>%
+  group_by(USER_ID) %>%
+  summarise(
+    RESTING_HEART_RATE = mean(RESTING_HEART_RATE, na.rm = TRUE),
+    HRV = mean(HRV, na.rm = TRUE),
+    SHRZS = mean(SHRZS, na.rm = TRUE),
+    MINUTES_OF_SLEEP = mean(MINUTES_OF_SLEEP, na.rm = TRUE),
+
+    # Retain static attributes
+    BMI = first(na.omit(BMI)),
+    AGE_2023 = first(na.omit(AGE_2023)),
+    GENDER = first(na.omit(GENDER)),
+    AGE_BUCKET = first(na.omit(AGE_BUCKET)),
+    .groups = "drop"
+  )
+
+describe_vars <- function(data, group_name = "Overall") {
+  vars <- c("RESTING_HEART_RATE", "HRV", "SHRZS", "MINUTES_OF_SLEEP", "BMI", "AGE_2023")
+  
+  summary_stats <- data %>%
+    summarise(across(all_of(vars),
+                     list(mean = ~mean(.x, na.rm = TRUE),
+                          sd = ~sd(.x, na.rm = TRUE)),
+                     .names = "{.col}_{.fn}"))
+  
+  summary_stats$Group <- group_name
+  return(summary_stats)
+}
+
+# Overall
+overall_stats <- describe_vars(df_person, "Overall")
+
+# By GENDER
+gender_stats <- df_person %>%
+  group_by(GENDER) %>%
+  group_modify(~describe_vars(.x, unique(.x$GENDER)))
+
+# By AGE_BUCKET
+agebucket_stats <- df_person %>%
+  group_by(AGE_BUCKET) %>%
+  group_modify(~describe_vars(.x, unique(.x$AGE_BUCKET)))
+
+# Combine all results
+descriptive_summary <- bind_rows(overall_stats, gender_stats, agebucket_stats)
+
+# Variables to test
+vars <- c(
+  "RESTING_HEART_RATE",
+  "HRV",
+  "SHRZS",
+  "MINUTES_OF_SLEEP",
+  "BMI",
+  "AGE_2023"
+)
+
+# Run Welch t-tests for each variable
+gender_ttests <- map_df(vars, function(v) {
+
+  tt <- t.test(df_person[[v]] ~ df_person$GENDER)
+
+  tibble(
+    Variable = v,
+    mean_male = mean(df_person[[v]][df_person$GENDER == "male"], na.rm = TRUE),
+    mean_female = mean(df_person[[v]][df_person$GENDER == "female"], na.rm = TRUE),
+    diff = mean_female - mean_male,
+    t = as.numeric(tt$statistic),
+    p = round(tt$p.value, 4)
+  )
+})
+
+# Apply Holm correction across all variables
+gender_ttests$p_holm <- round(p.adjust(gender_ttests$p, method = "holm"), 4)
+
+gender_ttests
+
+# Run ANOVA for each variable
+agebucket_anova <- map_df(vars, function(v) {
+
+  model <- aov(df_person[[v]] ~ df_person$AGE_BUCKET)
+  tidy_res <- tidy(model)[1, ]  # Extract only the AGE_BUCKET row
+
+  tibble(
+    Variable = v,
+    F = round(tidy_res$statistic, 2),
+    p = round(tidy_res$p.value, 4)
+  )
+})
+
+# Apply Holm correction across all variables
+agebucket_anova$p_holm <- round(p.adjust(agebucket_anova$p, method = "holm"), 4)
+
+agebucket_anova
+
+# Variables to follow up on (excluding BMI)
+followup_vars <- c(
+  "RESTING_HEART_RATE",
+  "HRV",
+  "SHRZS",
+  "MINUTES_OF_SLEEP",
+  "AGE_2023"
+)
+
+# Run ANOVA + Tukey HSD per variable
+tukey_results <- map_df(followup_vars, function(v) {
+  
+  model <- aov(df_person[[v]] ~ df_person$AGE_BUCKET)
+  tk <- TukeyHSD(model, "df_person$AGE_BUCKET")
+  
+  as_tibble(tk$`df_person$AGE_BUCKET`, rownames = "contrast") %>%
+    mutate(
+      Variable = v,
+      estimate = round(diff, 4),
+      p_adj = round(`p adj`, 4)
+    ) %>%
+    select(Variable, contrast, estimate, p_adj)
+})
+
+tukey_results
+
+```
+
+### Create field for month and compute RHR/HRV offset (decompose)
+```{r}
+# Create field for month
+df_month <- df_month %>%
+  mutate(
+    MONTH_NUM = month(MONTH),  
+    GENDER = as.factor(GENDER),
+    USER_ID = as.factor(USER_ID)
+  )
+
+df_month <- df_month %>%
+  group_by(USER_ID) %>%
+  mutate(
+    # Between-person RHR: average per user
+    RHR_person_mean = mean(RESTING_HEART_RATE, na.rm = TRUE),
+    
+    # Within-person RHR: deviation from person's mean (centered RHR)
+    RHR_within = RESTING_HEART_RATE - RHR_person_mean
+  ) %>%
+  ungroup()
+
+df_month <- df_month %>%
+  group_by(USER_ID) %>%
+  mutate(
+    # Between-person HRV: average per user
+    HRV_person_mean = mean(HRV, na.rm = TRUE),
+    
+    # Within-person HRV: deviation from person's mean (centered HRV)
+    HRV_within = HRV - HRV_person_mean
+  ) %>%
+  ungroup()
+```
+
+
+# AIM 1
+## RHR Overall
+```{r}
+# Baseline RHR model (stored for reuse in Aim 2 attenuation analyses)
+model_rhr_baseline <- bam(
+  RHR_within ~
+    s(MONTH_NUM, bs = "cc", k = 12) +
+    s(AGE_2023) +
+    GENDER +
+    BMI +
+    RHR_person_mean,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+v_df_rhr_overall <- predict_marginal_trajectory(model_rhr_baseline, data = df_month)
+
+p_s1a <- ggplot(v_df_rhr_overall, aes(x = MONTH_NUM, y = visregFit)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr),
+              fill = "black", alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality(legend = FALSE)
+p_s1a
+
+# ---- Identify modeled peak/trough and amplitude ----
+peak_month <- v_df_rhr_overall %>% filter(visregFit == max(visregFit)) %>% select(MONTH_NUM, visregFit)
+trough_month <- v_df_rhr_overall %>% filter(visregFit == min(visregFit)) %>% select(MONTH_NUM, visregFit)
+modeled_amplitude <- peak_month$visregFit - trough_month$visregFit
+
+# Bootstrap amplitude (participant-level resampling)
+formula_rhr_baseline <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + RHR_person_mean
+
+boot_rhr_overall <- bootstrap_amplitude(df_month, formula_rhr_baseline)
+
+amplitude_ci <- quantile(boot_rhr_overall$amplitude, probs = c(0.025, 0.975), na.rm = TRUE)
+amplitude_mean <- mean(boot_rhr_overall$amplitude, na.rm = TRUE)
+
+cat("Bootstrapped amplitude mean:", round(amplitude_mean, 3), "\n")
+cat("95% CI:", round(amplitude_ci[1], 3), "-", round(amplitude_ci[2], 3), "\n")
+```
+
+## HRV Overall
+```{r}
+# Baseline HRV model (stored for reuse in Aim 2 attenuation analyses)
+model_hrv_baseline <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+v_df_hrv_overall <- predict_marginal_trajectory(model_hrv_baseline, data = df_month)
+
+p_s1b <- ggplot(v_df_hrv_overall, aes(x = MONTH_NUM, y = visregFit)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), fill = "black", alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality(legend = FALSE)
+p_s1b
+
+# ---- Identify modeled peak/trough and amplitude ----
+peak_month <- v_df_hrv_overall %>% filter(visregFit == max(visregFit)) %>% select(MONTH_NUM, visregFit)
+trough_month <- v_df_hrv_overall %>% filter(visregFit == min(visregFit)) %>% select(MONTH_NUM, visregFit)
+modeled_amplitude <- peak_month$visregFit - trough_month$visregFit
+
+# Bootstrap amplitude (participant-level resampling)
+formula_hrv_baseline <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean
+
+boot_hrv_overall <- bootstrap_amplitude(df_month, formula_hrv_baseline)
+
+amplitude_ci <- quantile(boot_hrv_overall$amplitude, probs = c(0.025, 0.975), na.rm = TRUE)
+amplitude_mean <- mean(boot_hrv_overall$amplitude, na.rm = TRUE)
+
+cat("Bootstrapped amplitude mean:", round(amplitude_mean, 3), "\n")
+cat("95% CI:", round(amplitude_ci[1], 3), "-", round(amplitude_ci[2], 3), "\n")
+```
+
+
+## RHR by AGE
+### Model 1 - GAM
+```{r}
+df_month <- df_month %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+# ---- Fit GAMM model with cyclic spline by AGE_BUCKET ----
+model_rhr_age <- bam(
+  RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET + GENDER + BMI + RHR_person_mean,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# Extract smooths via marginal-trajectory helper
+v_df <- predict_marginal_trajectory(
+  model_rhr_age,
+  data = df_month,
+  by_var = "AGE_BUCKET"
+) %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+
+# ---- Plot ----
+p_fig1a <- ggplot(v_df, aes(x = MONTH_NUM, y = visregFit, color = AGE_BUCKET, fill = AGE_BUCKET)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Age Group", values = age_colors) +
+  scale_fill_manual(name = "Age Group", values = age_colors) +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = month.abb,
+    name = NULL
+  ) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_fig1a
+
+
+# ---- Bootstrap modeled amplitude by AGE_BUCKET ----
+formula_rhr_age <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET + GENDER + BMI + RHR_person_mean
+
+boot_rhr_age <- bootstrap_amplitude(df_month, formula_rhr_age, by = "AGE_BUCKET")
+
+bootstrap_summary <- boot_rhr_age %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals <- bootstrap_pairwise(boot_rhr_age, "AGE_BUCKET")
+```
+### Model 2 - GAMM
+```{r}
+set.seed(2024)
+
+subsample_ids <- df_month %>%
+  distinct(USER_ID, AGE_BUCKET, GENDER) %>%
+  group_by(AGE_BUCKET, GENDER) %>%
+  slice_sample(n = 1000) %>%
+  ungroup()
+
+df_sub <- df_month %>%
+  semi_join(subsample_ids, by = "USER_ID")
+
+df_sub <- df_sub %>%
+  mutate(USER_ID = as.factor(USER_ID))
+
+df_sub <- df_sub %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+model_rhr_age_mixed <- bam(
+  RHR_within ~ 
+    s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + 
+    AGE_BUCKET + GENDER + BMI + RHR_person_mean + 
+    s(USER_ID, bs = "re"),
+  data = df_sub,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+summary(model_rhr_age_mixed)
+
+# Extract smooths via marginal-trajectory helper (excluding random effect)
+v_mixed_df <- predict_marginal_trajectory(
+  model_rhr_age_mixed,
+  data = df_sub,
+  by_var = "AGE_BUCKET",
+  exclude_re = "s(USER_ID)"
+) %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+
+# Plot
+p_s2a <- ggplot(v_mixed_df, aes(x = MONTH_NUM, y = visregFit, color = AGE_BUCKET, fill = AGE_BUCKET)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Age Group", values = age_colors) +
+  scale_fill_manual(name = "Age Group", values = age_colors) +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = month.abb,
+    name = NULL
+  ) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s2a
+
+#Extract amplitude values
+amplitude_gamm <- v_mixed_df %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(
+    amplitude = max(visregFit, na.rm = TRUE) - min(visregFit, na.rm = TRUE),
+    peak_month = MONTH_NUM[which.max(visregFit)],
+    trough_month = MONTH_NUM[which.min(visregFit)],
+    .groups = "drop"
+  )
+
+## EMMEANS Comparisons via lpmatrix
+res <- emmeans_contrasts_lpmatrix(model_rhr_age_mixed, data = df_sub, by_var = "AGE_BUCKET")
+emm_manual    <- res$emm
+contrasts_all <- res$contrasts
+
+print("Estimated Marginal Means:")
+print(emm_manual)
+print("Pairwise Contrasts:")
+print(contrasts_all)
+```
+### Model 3 - Individual Level Amplitude
+```{r}
+# ---- Compute per-person RHR amplitude: December - August ----
+df_amplitude <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(SEASON = case_when(
+    MONTH_NUM == 8 ~ "August",
+    MONTH_NUM == 12 ~ "December"
+  )) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_rhr = mean(RHR_within, na.rm = TRUE),
+    AGE_BUCKET = first(AGE_BUCKET),
+    AGE_2023 = first(AGE_2023),
+    BMI = first(BMI),
+    GENDER = first(GENDER),
+    RHR_person_mean = first(RHR_person_mean),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_rhr) %>%
+  mutate(
+    amplitude = December - August  # RHR: winter minus summer
+  )
+
+# ---- Per-person amplitude summary by age bucket ----
+amplitude_summary <- df_amplitude %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(
+    mean_amplitude = mean(amplitude, na.rm = TRUE),
+    sd_amplitude = sd(amplitude, na.rm = TRUE),
+    n = n(),
+    mean_sd = paste0(round(mean_amplitude, 2), " ± ", round(sd_amplitude, 2)),
+    .groups = "drop"
+  )
+
+
+# ---- Linear model predicting per-person amplitude ----
+model_amplitude <- lm(amplitude ~ AGE_BUCKET + GENDER + BMI + RHR_person_mean, data = df_amplitude)
+anova(model_amplitude)
+# ---- 95% Confidence Intervals for model coefficients ----
+confint(model_amplitude)
+
+# Get estimated marginal means
+emm <- emmeans(model_amplitude, ~ AGE_BUCKET)
+# Pairwise Tukey comparisons
+tukey_results <- pairs(emm, adjust = "tukey")
+# View results
+summary(tukey_results, infer = c(TRUE, TRUE))  # Adds CIs and p-values
+
+
+df_amplitude <- df_amplitude %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+p_fig1b <- ggplot(df_amplitude, aes(x = AGE_BUCKET, y = amplitude, fill = AGE_BUCKET)) +
+  geom_violin(trim = FALSE, alpha = 0.5, color = NA) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 3, fill = "white") +
+  scale_fill_manual(values = age_colors) +
+  scale_y_continuous(name = "RHR Amplitude (Dec − Aug, bpm)") +
+  coord_cartesian(ylim = c(-5, 13)) +
+  labs(x = NULL, y = "RHR Amplitude (Dec − Aug, bpm)") +
+  theme_seasonality(legend = FALSE) +
+  violin_brackets_layer(tukey_results,
+    comparisons = list(c("Young", "Middle"), c("Middle", "Old"), c("Young", "Old")),
+    group_levels = c("Young", "Middle", "Old"),
+    y_positions = c(10.5, 11.7, 12.9))
+p_fig1b
+```
+### Model 4 - Box and Whisker of Raw RHR Values in Peak and Trough Months by Age
+```{r}
+# Filter for August and December
+df_aug_dec <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(
+    MONTH_LABEL = factor(ifelse(MONTH_NUM == 8, "August", "December"), levels = c("August", "December")),
+    AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")),
+    pattern = ifelse(MONTH_LABEL == "December", "stripe", "none")
+  )
+# Plot using ggpattern
+p_s2b <- ggplot(df_aug_dec, aes(x = AGE_BUCKET, y = RESTING_HEART_RATE)) +
+  geom_boxplot_pattern(
+    aes(
+      fill = AGE_BUCKET,
+      pattern = MONTH_LABEL,
+      pattern_fill = AGE_BUCKET
+    ),
+    position = position_dodge(width = 0.75),
+    color = "black",
+    pattern_density = 0.4,
+    pattern_spacing = 0.05,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    aes(group = interaction(MONTH_LABEL, AGE_BUCKET)),
+    position = position_dodge(width = 0.75),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black"
+  ) +
+  scale_fill_manual(values = age_colors) +
+  scale_pattern_fill_manual(values = age_colors) +
+  scale_pattern_manual(
+    values = c("August" = "none", "December" = "stripe"),
+    name = "Month"
+  ) +
+  guides(
+    fill = "none",
+    pattern_fill = "none",
+    pattern = guide_legend(
+      override.aes = list(
+        fill = "grey70",
+        pattern_density = 0.5,
+        pattern_spacing = 0.02
+      )
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Resting Heart Rate (bpm)"
+  ) +
+  theme_seasonality()
+p_s2b
+
+# Fit linear mixed model with AGE_BUCKET * MONTH_NUM interaction
+model_aug_dec_rhr_age <- lmer(
+  RESTING_HEART_RATE ~ AGE_BUCKET * MONTH_LABEL + GENDER + BMI + (1 | USER_ID),
+  data = df_aug_dec
+)
+
+anova(model_aug_dec_rhr_age)
+
+# Age group comparisons within each month
+emmeans(model_aug_dec_rhr_age, pairwise ~ AGE_BUCKET | MONTH_LABEL, adjust = "holm")
+
+# August vs December within each age group
+emmeans(model_aug_dec_rhr_age, pairwise ~ MONTH_LABEL | AGE_BUCKET, adjust = "holm")
+
+# Add within-group Aug→Dec brackets + interaction-p subtitle
+p_s2b <- p_s2b + aug_dec_brackets_layer(
+  model_aug_dec_rhr_age, df_aug_dec, y_var = "RESTING_HEART_RATE",
+  by_var = "AGE_BUCKET", group_levels = c("Young", "Middle", "Old"),
+  interaction_term = "AGE_BUCKET:MONTH_LABEL", by_label = "Age"
+)
+```
+
+
+## HRV by AGE
+### Model 1 - GAM
+```{r}
+# GAM model for HRV
+model_hrv_age <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET + GENDER + BMI + HRV_person_mean,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+
+v_hrv_df <- predict_marginal_trajectory(
+  model_hrv_age,
+  data = df_month,
+  by_var = "AGE_BUCKET"
+) %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+p_fig1c <- ggplot(v_hrv_df, aes(x = MONTH_NUM, y = visregFit, color = AGE_BUCKET, fill = AGE_BUCKET)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Age Group", values = age_colors) +
+  scale_fill_manual(name = "Age Group", values = age_colors) +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = month.abb,
+    name = NULL
+  ) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_fig1c
+
+
+# ---- Bootstrap modeled amplitude by AGE_BUCKET ----
+formula_hrv_age <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET + GENDER + BMI + HRV_person_mean
+
+boot_hrv_age <- bootstrap_amplitude(df_month, formula_hrv_age, by = "AGE_BUCKET")
+
+bootstrap_summary_hrv_age <- boot_hrv_age %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_age <- bootstrap_pairwise(boot_hrv_age, "AGE_BUCKET")
+```
+### Model 2 - GAMM
+```{r}
+model_hrv_age_mixed <- bam(
+  HRV_within ~ 
+    s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) +
+    AGE_BUCKET + GENDER + BMI + HRV_person_mean +
+    s(USER_ID, bs = "re"),
+  data = df_sub,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+summary(model_hrv_age_mixed)
+
+
+v_mixed_hrv_df <- predict_marginal_trajectory(
+  model_hrv_age_mixed,
+  data = df_sub,
+  by_var = "AGE_BUCKET",
+  exclude_re = "s(USER_ID)"
+) %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+p_s2c <- ggplot(v_mixed_hrv_df, aes(x = MONTH_NUM, y = visregFit, color = AGE_BUCKET, fill = AGE_BUCKET)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Age Group", values = age_colors) +
+  scale_fill_manual(name = "Age Group", values = age_colors) +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = month.abb,
+    name = NULL
+  ) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s2c
+
+amplitude_gamm_hrv <- v_mixed_hrv_df %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(
+    amplitude = max(visregFit, na.rm = TRUE) - min(visregFit, na.rm = TRUE),
+    peak_month = MONTH_NUM[which.max(visregFit)],
+    trough_month = MONTH_NUM[which.min(visregFit)],
+    .groups = "drop"
+  )
+
+# --- HRV EMMEANS comparisons via lpmatrix ---
+res_hrv <- emmeans_contrasts_lpmatrix(model_hrv_age_mixed, data = df_sub, by_var = "AGE_BUCKET")
+emm_manual_hrv    <- res_hrv$emm
+contrasts_all_hrv <- res_hrv$contrasts
+
+print("Estimated Marginal Means (HRV):")
+print(emm_manual_hrv)
+print("Pairwise Contrasts (HRV):")
+print(contrasts_all_hrv)
+```
+### Model 3 - Invividual Level Amplitude
+```{r}
+df_amplitude_hrv <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(SEASON = case_when(
+    MONTH_NUM == 8 ~ "August",
+    MONTH_NUM == 12 ~ "December"
+  )) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_hrv = mean(HRV_within, na.rm = TRUE),
+    AGE_BUCKET = first(AGE_BUCKET),
+    AGE_2023 = first(AGE_2023),
+    BMI = first(BMI),
+    GENDER = first(GENDER),
+    HRV_person_mean = first(HRV_person_mean),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_hrv) %>%
+  mutate(
+    amplitude = August - December   
+  )
+
+amplitude_summary_hrv <- df_amplitude_hrv %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(
+    mean_amplitude = mean(amplitude, na.rm = TRUE),
+    sd_amplitude = sd(amplitude, na.rm = TRUE),
+    n = n(),
+    mean_sd = paste0(round(mean_amplitude, 2), " ± ", round(sd_amplitude, 2)),
+    .groups = "drop"
+  )
+
+model_amplitude_hrv <- lm(amplitude ~ AGE_BUCKET + GENDER + BMI + HRV_person_mean, 
+                          data = df_amplitude_hrv)
+
+anova(model_amplitude_hrv)
+confint(model_amplitude_hrv)
+
+emm_hrv <- emmeans(model_amplitude_hrv, ~ AGE_BUCKET)
+
+tukey_results_hrv <- pairs(emm_hrv, adjust = "tukey")
+
+summary(tukey_results_hrv, infer = c(TRUE, TRUE))
+
+df_amplitude_hrv <- df_amplitude_hrv %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+p_fig1d <- ggplot(df_amplitude_hrv, aes(x = AGE_BUCKET, y = amplitude, fill = AGE_BUCKET)) +
+  geom_violin(trim = FALSE, alpha = 0.5, color = NA) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 3, fill = "white") +
+  scale_fill_manual(values = age_colors) +
+  scale_y_continuous(name = "HRV Amplitude (Aug − Dec, ms)") +
+  coord_cartesian(ylim = c(-20, 40)) +
+  labs(x = NULL, y = "HRV Amplitude (Aug − Dec, ms)") +
+  theme_seasonality(legend = FALSE) +
+  violin_brackets_layer(tukey_results_hrv,
+    comparisons = list(c("Young", "Middle"), c("Middle", "Old"), c("Young", "Old")),
+    group_levels = c("Young", "Middle", "Old"),
+    y_positions = c(31, 34, 37),
+    tip_length = 1)
+p_fig1d
+```
+### Model 4 - Box and Whisker of Raw HRV values in Peak and Trough Months by Age
+```{r}
+# Plot
+p_s2d <- ggplot(df_aug_dec, aes(x = AGE_BUCKET, y = HRV)) +
+  geom_boxplot_pattern(
+    aes(
+      fill = AGE_BUCKET,
+      pattern = MONTH_LABEL,
+      pattern_fill = AGE_BUCKET
+    ),
+    position = position_dodge(width = 0.75),
+    color = "black",
+    pattern_density = 0.4,
+    pattern_spacing = 0.05,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    aes(group = interaction(MONTH_LABEL, AGE_BUCKET)),
+    position = position_dodge(width = 0.75),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black"
+  ) +
+  scale_fill_manual(values = age_colors) +
+  scale_pattern_fill_manual(values = age_colors) +
+  scale_pattern_manual(
+    values = c("August" = "none", "December" = "stripe"),
+    name = "Month"
+  ) +
+  guides(
+    fill = "none",
+    pattern_fill = "none",
+    pattern = guide_legend(
+      override.aes = list(
+        fill = "grey70",
+        pattern_density = 0.5,
+        pattern_spacing = 0.02
+      )
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Heart Rate Variability (ms)"
+  ) +
+  coord_cartesian(ylim = c(0, 150)) +
+  theme_seasonality()
+p_s2d
+
+# ---- Step 4: Linear Mixed Model ----
+model_aug_dec_hrv_age <- lmer(
+  HRV ~ AGE_BUCKET * MONTH_LABEL + GENDER + BMI + (1 | USER_ID),
+  data = df_aug_dec
+)
+
+# ---- Step 5: ANOVA table ----
+anova(model_aug_dec_hrv_age)
+
+# ---- Step 6: Pairwise comparisons ----
+
+# Age group comparisons within each month
+emmeans(model_aug_dec_hrv_age, pairwise ~ AGE_BUCKET | MONTH_LABEL, adjust = "holm")
+
+# August vs December within each age group
+emmeans(model_aug_dec_hrv_age, pairwise ~ MONTH_LABEL | AGE_BUCKET, adjust = "holm")
+
+# Add within-group Aug→Dec brackets + interaction-p subtitle
+p_s2d <- p_s2d + aug_dec_brackets_layer(
+  model_aug_dec_hrv_age, df_aug_dec, y_var = "HRV",
+  by_var = "AGE_BUCKET", group_levels = c("Young", "Middle", "Old"),
+  interaction_term = "AGE_BUCKET:MONTH_LABEL", by_label = "Age"
+)
+```
+
+
+## RHR by SEX
+### Model 1 - GAM
+```{r}
+df_month <- df_month %>%
+  mutate(GENDER = factor(GENDER, levels = c("male", "female")))  
+
+model_rhr_gender <- bam(
+  RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = GENDER) + GENDER + s(AGE_2023) + BMI + RHR_person_mean,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+v_df_gender <- predict_marginal_trajectory(
+  model_rhr_gender,
+  data = df_month,
+  by_var = "GENDER"
+) %>%
+  mutate(GENDER = factor(GENDER, levels = c("male", "female")))
+
+p_fig2a <- ggplot(v_df_gender, aes(x = MONTH_NUM, y = visregFit, color = GENDER, fill = GENDER)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Sex", values = gender_colors, labels = gender_labels) +
+  scale_fill_manual(name = "Sex", values = gender_colors, labels = gender_labels) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+
+p_fig2a
+
+formula_rhr_sex <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = GENDER) + GENDER + s(AGE_2023) + BMI + RHR_person_mean
+
+boot_rhr_sex <- bootstrap_amplitude(df_month, formula_rhr_sex, by = "GENDER")
+
+bootstrap_summary_sex_rhr <- boot_rhr_sex %>%
+  group_by(GENDER) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_sex_rhr <- bootstrap_pairwise(boot_rhr_sex, "GENDER")
+```
+### Model 2 - GAMM
+```{r}
+model_rhr_gender_mixed <- bam(
+  RHR_within ~ 
+    s(MONTH_NUM, bs = "cc", k = 12, by = GENDER) +
+    GENDER + s(AGE_2023) + BMI + RHR_person_mean +
+    s(USER_ID, bs = "re"),
+  data = df_sub,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+v_mixed_gender_df <- predict_marginal_trajectory(
+  model_rhr_gender_mixed,
+  data = df_sub,
+  by_var = "GENDER",
+  exclude_re = "s(USER_ID)"
+) %>%
+  mutate(GENDER = factor(GENDER, levels = c("male", "female")))
+
+p_s3a <- ggplot(v_mixed_gender_df, aes(x = MONTH_NUM, y = visregFit, color = GENDER, fill = GENDER)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Sex", values = gender_colors, labels = gender_labels) +
+  scale_fill_manual(name = "Sex", values = gender_colors, labels = gender_labels) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+
+p_s3a
+
+amplitude_gamm_gender <- v_mixed_gender_df %>%
+  group_by(GENDER) %>%
+  summarise(
+    amplitude = max(visregFit, na.rm = TRUE) - min(visregFit, na.rm = TRUE),
+    peak_month = MONTH_NUM[which.max(visregFit)],
+    trough_month = MONTH_NUM[which.min(visregFit)],
+    .groups = "drop"
+  )
+
+# --- RHR-by-Gender EMMEANS comparisons via lpmatrix ---
+res_gender <- emmeans_contrasts_lpmatrix(model_rhr_gender_mixed, data = df_sub, by_var = "GENDER")
+emm_manual_gender <- res_gender$emm
+gender_contrasts  <- res_gender$contrasts
+
+print("Estimated Marginal Means (RHR by Gender):")
+print(emm_manual_gender)
+print("Gender Contrasts (RHR):")
+print(gender_contrasts)
+```
+### Model 3 - Individual Level Amplitude
+```{r}
+df_amplitude_gender <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(SEASON = case_when(
+    MONTH_NUM == 8 ~ "August",
+    MONTH_NUM == 12 ~ "December"
+  )) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_rhr = mean(RHR_within, na.rm = TRUE),
+    GENDER = first(GENDER),
+    AGE_2023 = first(AGE_2023),
+    BMI = first(BMI),
+    RHR_person_mean = first(RHR_person_mean),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_rhr) %>%
+  mutate(
+    amplitude = December - August
+  )
+
+amplitude_summary_gender <- df_amplitude_gender %>%
+  group_by(GENDER) %>%
+  summarise(
+    mean_amplitude = mean(amplitude, na.rm = TRUE),
+    sd_amplitude = sd(amplitude, na.rm = TRUE),
+    n = n(),
+    mean_sd = paste0(round(mean_amplitude, 2), " ± ", round(sd_amplitude, 2)),
+    .groups = "drop"
+  )
+
+model_amplitude_gender <- lm(amplitude ~ GENDER + splines::ns(AGE_2023, df = 3) + BMI + RHR_person_mean, data = df_amplitude_gender)
+anova(model_amplitude_gender)
+
+confint(model_amplitude_gender)
+
+emm_gender <- emmeans(model_amplitude_gender, ~ GENDER)
+tukey_gender <- pairs(emm_gender, adjust = "tukey")
+summary(tukey_gender, infer = c(TRUE, TRUE))
+
+# Set order of GENDER for plotting
+df_amplitude_gender <- df_amplitude_gender %>%
+  mutate(GENDER = factor(GENDER, levels = c("male", "female")))
+
+p_fig2b <- ggplot(df_amplitude_gender, aes(x = GENDER, y = amplitude, fill = GENDER)) +
+  geom_violin(trim = FALSE, alpha = 0.5, color = NA) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 3, fill = "white") +
+  scale_fill_manual(values = gender_colors) +
+  scale_x_discrete(labels = gender_labels) +
+  scale_y_continuous(name = "RHR Amplitude (Dec - Aug, bpm)") +
+  coord_cartesian(ylim = c(-5, 12)) +
+  labs(x = NULL, y = "RHR Amplitude (Dec - Aug, bpm)") +
+  theme_seasonality(legend = FALSE) +
+  violin_brackets_layer(tukey_gender,
+    comparisons = list(c("male", "female")),
+    group_levels = c("male", "female"),
+    y_positions = c(10.5))
+
+p_fig2b
+
+```
+### Model 4 - Box and Whisker of Raw RHR Values in Peak and Trough Months by Sex
+```{r}
+# ---- Boxplot of Raw RHR ----
+# Order x-axis male, female to match panel D (Figure S3D)
+df_aug_dec <- df_aug_dec %>%
+  mutate(GENDER = factor(GENDER, levels = c("male", "female")))
+p_s3b <- ggplot(df_aug_dec, aes(x = GENDER, y = RESTING_HEART_RATE)) +
+  geom_boxplot_pattern(
+    aes(
+      fill = GENDER,
+      pattern = MONTH_LABEL,
+      pattern_fill = GENDER
+    ),
+    position = position_dodge(width = 0.75),
+    color = "black",
+    pattern_density = 0.4,
+    pattern_spacing = 0.05,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    aes(group = interaction(MONTH_LABEL, GENDER)),
+    position = position_dodge(width = 0.75),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black"
+  ) +
+  scale_fill_manual(values = gender_colors) +
+  scale_pattern_fill_manual(values = gender_colors) +
+  scale_x_discrete(labels = gender_labels) +
+  scale_pattern_manual(
+    values = c("August" = "none", "December" = "stripe"),
+    name = "Month"
+  ) +
+  guides(
+    fill = "none",
+    pattern_fill = "none",
+    pattern = guide_legend(
+      override.aes = list(
+        fill = "grey70",
+        pattern_density = 0.5,
+        pattern_spacing = 0.02
+      )
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Resting Heart Rate (bpm)"
+  ) +
+  theme_seasonality()
+
+p_s3b
+
+# ---- Linear Mixed Model: Sex × Month ----
+model_aug_dec_rhr_gender <- lmer(
+  RESTING_HEART_RATE ~ GENDER * MONTH_LABEL + splines::ns(AGE_2023, df = 3) + BMI + (1 | USER_ID),
+  data = df_aug_dec
+)
+
+anova(model_aug_dec_rhr_gender)
+
+# ---- Pairwise comparisons: sex differences within each month ----
+emmeans(model_aug_dec_rhr_gender, pairwise ~ GENDER | MONTH_LABEL, adjust = "holm")
+
+# ---- Pairwise comparisons: month differences within each sex ----
+emmeans(model_aug_dec_rhr_gender, pairwise ~ MONTH_LABEL | GENDER, adjust = "holm")
+
+# Add within-sex Aug→Dec brackets + interaction-p subtitle
+p_s3b <- p_s3b + aug_dec_brackets_layer(
+  model_aug_dec_rhr_gender, df_aug_dec, y_var = "RESTING_HEART_RATE",
+  by_var = "GENDER", group_levels = c("female", "male"),
+  interaction_term = "GENDER:MONTH_LABEL", by_label = "Sex"
+)
+
+# Refit model with only main effects
+model_rhr_gender_main <- lmer(
+  RESTING_HEART_RATE ~ GENDER + MONTH_LABEL + splines::ns(AGE_2023, df = 3) + BMI + (1 | USER_ID),
+  data = df_aug_dec
+)
+anova(model_rhr_gender_main)
+
+# EMMs for gender
+emmeans(model_rhr_gender_main, ~ GENDER)
+
+# EMMs for month
+emmeans(model_rhr_gender_main, ~ MONTH_LABEL)
+```
+
+
+## HRV by SEX
+### Model 1
+```{r}
+model_hrv_gender <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = GENDER) + GENDER + s(AGE_2023) + BMI + HRV_person_mean,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+v_df_gender_hrv <- predict_marginal_trajectory(
+  model_hrv_gender,
+  data = df_month,
+  by_var = "GENDER"
+) %>%
+  mutate(GENDER = factor(GENDER, levels = c("male", "female")))
+
+p_fig2c <- ggplot(v_df_gender_hrv, aes(x = MONTH_NUM, y = visregFit, color = GENDER, fill = GENDER)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Sex", values = gender_colors, labels = gender_labels) +
+  scale_fill_manual(name = "Sex", values = gender_colors, labels = gender_labels) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+
+p_fig2c
+
+formula_hrv_sex <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = GENDER) + GENDER + s(AGE_2023) + BMI + HRV_person_mean
+
+boot_hrv_sex <- bootstrap_amplitude(df_month, formula_hrv_sex, by = "GENDER")
+
+bootstrap_summary_sex_hrv <- boot_hrv_sex %>%
+  group_by(GENDER) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_sex_hrv <- bootstrap_pairwise(boot_hrv_sex, "GENDER")
+```
+### Model 2
+```{r}
+model_hrv_gender_mixed <- bam(
+  HRV_within ~ 
+    s(MONTH_NUM, bs = "cc", k = 12, by = GENDER) +
+    GENDER + s(AGE_2023) + BMI + HRV_person_mean +
+    s(USER_ID, bs = "re"),
+  data = df_sub,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+v_mixed_gender_df_hrv <- predict_marginal_trajectory(
+  model_hrv_gender_mixed,
+  data = df_sub,
+  by_var = "GENDER",
+  exclude_re = "s(USER_ID)"
+) %>%
+  mutate(GENDER = factor(GENDER, levels = c("male", "female")))
+
+p_s3c <- ggplot(v_mixed_gender_df_hrv, aes(x = MONTH_NUM, y = visregFit, color = GENDER, fill = GENDER)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Sex", values = gender_colors, labels = gender_labels) +
+  scale_fill_manual(name = "Sex", values = gender_colors, labels = gender_labels) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+
+p_s3c
+
+amplitude_gamm_gender_hrv <- v_mixed_gender_df_hrv %>%
+  group_by(GENDER) %>%
+  summarise(
+    amplitude = max(visregFit, na.rm = TRUE) - min(visregFit, na.rm = TRUE),
+    peak_month = MONTH_NUM[which.max(visregFit)],
+    trough_month = MONTH_NUM[which.min(visregFit)],
+    .groups = "drop"
+  )
+
+# --- HRV-by-Gender EMMEANS comparisons via lpmatrix ---
+res_gender_hrv <- emmeans_contrasts_lpmatrix(model_hrv_gender_mixed, data = df_sub, by_var = "GENDER")
+emm_manual_gender_hrv <- res_gender_hrv$emm
+gender_contrasts_hrv  <- res_gender_hrv$contrasts
+
+print("Estimated Marginal Means (HRV by Gender):")
+print(emm_manual_gender_hrv)
+print("Gender Contrasts (HRV):")
+print(gender_contrasts_hrv)
+```
+### Model 3
+```{r}
+df_amplitude_gender_hrv <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(SEASON = case_when(
+    MONTH_NUM == 8 ~ "August",
+    MONTH_NUM == 12 ~ "December"
+  )) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_hrv = mean(HRV_within, na.rm = TRUE),
+    GENDER = first(GENDER),
+    AGE_2023 = first(AGE_2023),
+    BMI = first(BMI),
+    HRV_person_mean = first(HRV_person_mean),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_hrv) %>%
+  mutate(
+    amplitude = August - December
+  )
+
+amplitude_summary_gender_hrv <- df_amplitude_gender_hrv %>%
+  group_by(GENDER) %>%
+  summarise(
+    mean_amplitude = mean(amplitude, na.rm = TRUE),
+    sd_amplitude = sd(amplitude, na.rm = TRUE),
+    n = n(),
+    mean_sd = paste0(round(mean_amplitude, 2), " ± ", round(sd_amplitude, 2)),
+    .groups = "drop"
+  )
+
+model_amplitude_gender_hrv <- lm(amplitude ~ GENDER + splines::ns(AGE_2023, df = 3) + BMI + HRV_person_mean, data = df_amplitude_gender_hrv)
+anova(model_amplitude_gender_hrv)
+confint(model_amplitude_gender_hrv)
+
+emm_gender_hrv <- emmeans(model_amplitude_gender_hrv, ~ GENDER)
+tukey_gender_hrv <- pairs(emm_gender_hrv, adjust = "tukey")
+summary(tukey_gender_hrv, infer = c(TRUE, TRUE))
+
+df_amplitude_gender_hrv <- df_amplitude_gender_hrv %>%
+  mutate(GENDER = factor(GENDER, levels = c("male", "female")))
+
+p_fig2d <- ggplot(df_amplitude_gender_hrv, aes(x = GENDER, y = amplitude, fill = GENDER)) +
+  geom_violin(trim = FALSE, alpha = 0.5, color = NA) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 3, fill = "white") +
+  scale_fill_manual(values = gender_colors) +
+  scale_x_discrete(labels = gender_labels) +
+  scale_y_continuous(name = "HRV Amplitude (Aug - Dec, ms)") +
+  coord_cartesian(ylim = c(-20, 35)) +
+  labs(x = NULL, y = "HRV Amplitude (Aug - Dec, ms)") +
+  theme_seasonality(legend = FALSE) +
+  violin_brackets_layer(tukey_gender_hrv,
+    comparisons = list(c("male", "female")),
+    group_levels = c("male", "female"),
+    y_positions = c(31),
+    tip_length = 1)
+
+p_fig2d
+```
+### Model 4 - Box and Whisker of Raw HRV Values in Peak and Trough Months by Sex
+```{r}
+# ---- Filter and prepare data ----
+df_aug_dec_hrv <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(
+    MONTH_LABEL = factor(ifelse(MONTH_NUM == 8, "August", "December"),
+                         levels = c("August", "December")),
+    GENDER = factor(GENDER, levels = c("male", "female")),
+    pattern = ifelse(MONTH_LABEL == "December", "stripe", "none")
+  )
+
+# ---- Boxplot: HRV by Sex and Month ----
+p_s3d <- ggplot(df_aug_dec_hrv, aes(x = GENDER, y = HRV)) +
+  geom_boxplot_pattern(
+    aes(
+      fill = GENDER,
+      pattern = MONTH_LABEL,
+      pattern_fill = GENDER
+    ),
+    position = position_dodge(width = 0.75),
+    color = "black",
+    pattern_density = 0.4,
+    pattern_spacing = 0.05,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    aes(group = interaction(MONTH_LABEL, GENDER)),
+    position = position_dodge(width = 0.75),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black"
+  ) +
+  scale_fill_manual(values = gender_colors) +
+  scale_pattern_fill_manual(values = gender_colors) +
+  scale_x_discrete(labels = gender_labels) +
+  scale_pattern_manual(
+    values = c("August" = "none", "December" = "stripe"),
+    name = "Month"
+  ) +
+  guides(
+    fill = "none",
+    pattern_fill = "none",
+    pattern = guide_legend(
+      override.aes = list(
+        fill = "grey70",
+        pattern_density = 0.5,
+        pattern_spacing = 0.02
+      )
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Heart Rate Variability (ms)"
+  ) +
+  coord_cartesian(ylim = c(0, 150)) +
+  theme_seasonality()
+
+p_s3d
+
+# ---- Full model with interaction ----
+model_hrv_gender_interact <- lmer(
+  HRV ~ GENDER * MONTH_LABEL + splines::ns(AGE_2023, df = 3) + BMI + (1 | USER_ID),
+  data = df_aug_dec_hrv
+)
+
+anova(model_hrv_gender_interact)
+
+# ---- Pairwise comparisons: GENDER within MONTH ----
+emmeans(model_hrv_gender_interact, pairwise ~ GENDER | MONTH_LABEL, adjust = "holm")
+
+# ---- Pairwise comparisons: MONTH within GENDER ----
+emmeans(model_hrv_gender_interact, pairwise ~ MONTH_LABEL | GENDER, adjust = "holm")
+
+# Add within-sex Aug→Dec brackets + interaction-p subtitle
+p_s3d <- p_s3d + aug_dec_brackets_layer(
+  model_hrv_gender_interact, df_aug_dec_hrv, y_var = "HRV",
+  by_var = "GENDER", group_levels = c("female", "male"),
+  interaction_term = "GENDER:MONTH_LABEL", by_label = "Sex"
+)
+
+# ---- Refit model without interaction ----
+model_hrv_gender_main <- lmer(
+  HRV ~ GENDER + MONTH_LABEL + splines::ns(AGE_2023, df = 3) + BMI + (1 | USER_ID),
+  data = df_aug_dec_hrv
+)
+
+# ---- Main effect significance ----
+anova(model_hrv_gender_main)
+
+# ---- Estimated marginal means ----
+emmeans(model_hrv_gender_main, ~ GENDER)
+emmeans(model_hrv_gender_main, ~ MONTH_LABEL)
+
+```
+
+## Sex Sensitivity: Age-Matched Subsample (Young + Middle only)
+```{r}
+# Motivation: female subsample is ~4 yrs younger on average and contains
+# roughly half as many older adults as the male subsample. Although all
+# primary models adjust for age, restrict here to the age-matched
+# young + middle strata (3,000 per age x sex cell) to test whether the
+# population-level sex signal survives a cleanly balanced comparison.
+
+df_month_ym <- df_month %>% filter(AGE_BUCKET %in% c("Young", "Middle"))
+
+# Confirm balance
+df_month_ym %>% distinct(USER_ID, GENDER, AGE_BUCKET) %>% count(GENDER, AGE_BUCKET)
+
+# ---- RHR: age-matched sex GAM + bootstrap ----
+formula_rhr_sex_ym <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = GENDER) +
+  GENDER + AGE_2023 + BMI + RHR_person_mean
+
+model_rhr_sex_ym <- bam(formula_rhr_sex_ym, data = df_month_ym,
+                        method = "fREML", knots = MONTH_KNOTS, discrete = TRUE)
+
+boot_rhr_sex_ym <- bootstrap_amplitude(df_month_ym, formula_rhr_sex_ym, by = "GENDER")
+
+bootstrap_summary_rhr_sex_ym <- boot_rhr_sex_ym %>%
+  group_by(GENDER) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low   = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high  = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+boot_pvals_rhr_sex_ym <- bootstrap_pairwise(boot_rhr_sex_ym, "GENDER")
+
+# ---- HRV: age-matched sex GAM + bootstrap ----
+formula_hrv_sex_ym <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = GENDER) +
+  GENDER + AGE_2023 + BMI + HRV_person_mean
+
+model_hrv_sex_ym <- bam(formula_hrv_sex_ym, data = df_month_ym,
+                        method = "fREML", knots = MONTH_KNOTS, discrete = TRUE)
+
+boot_hrv_sex_ym <- bootstrap_amplitude(df_month_ym, formula_hrv_sex_ym, by = "GENDER")
+
+bootstrap_summary_hrv_sex_ym <- boot_hrv_sex_ym %>%
+  group_by(GENDER) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low   = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high  = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+boot_pvals_hrv_sex_ym <- bootstrap_pairwise(boot_hrv_sex_ym, "GENDER")
+
+# ---- Summary table: full sample vs age-matched subsample ----
+sex_sensitivity <- bind_rows(
+  bootstrap_summary_sex_rhr    %>% mutate(Outcome = "RHR", Sample = "Full"),
+  bootstrap_summary_rhr_sex_ym %>% mutate(Outcome = "RHR", Sample = "Young+Middle"),
+  bootstrap_summary_sex_hrv    %>% mutate(Outcome = "HRV", Sample = "Full"),
+  bootstrap_summary_hrv_sex_ym %>% mutate(Outcome = "HRV", Sample = "Young+Middle")
+)
+
+sex_sensitivity_pvals <- bind_rows(
+  boot_pvals_sex_rhr       %>% mutate(Outcome = "RHR", Sample = "Full"),
+  boot_pvals_rhr_sex_ym    %>% mutate(Outcome = "RHR", Sample = "Young+Middle"),
+  boot_pvals_sex_hrv       %>% mutate(Outcome = "HRV", Sample = "Full"),
+  boot_pvals_hrv_sex_ym    %>% mutate(Outcome = "HRV", Sample = "Young+Middle")
+)
+
+print(sex_sensitivity)
+print(sex_sensitivity_pvals)
+```
+
+
+# AIM 2
+## Physical Activity
+### RHR
+```{r}
+# Reuse baseline RHR model from Aim 1 (model_rhr_baseline)
+
+# Adjusted model (with PA)
+model_rhr_adj_pa <- bam(
+  RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + RHR_person_mean + SHRZS_b + SHRZS_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- Extract smooth fits ----
+v_base_df <- predict_marginal_trajectory(model_rhr_baseline, data = df_month) %>% mutate(Model = "Baseline")
+v_adj_df  <- predict_marginal_trajectory(model_rhr_adj_pa,  data = df_month) %>% mutate(Model = "Adjusted")
+
+plot_df <- bind_rows(v_base_df, v_adj_df)
+
+# ---- Overlay plot (Figure 3d) ----
+p_fig3d <- ggplot(plot_df, aes(x = MONTH_NUM, y = visregFit, color = Model, fill = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(values = c("Baseline" = "black", "Adjusted" = "#1f78b4")) +
+  scale_fill_manual(values = c("Baseline" = "black", "Adjusted" = "#1f78b4")) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_fig3d
+
+# ---- Bootstrap attenuation ----
+att_rhr_pa <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_rhr_baseline,
+  formula_adj = RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + RHR_person_mean + SHRZS_b + SHRZS_w
+)
+att_summary_rhr_pa <- summarize_attenuation(att_rhr_pa)
+```
+### HRV
+```{r}
+# Reuse baseline HRV model from Aim 1 (model_hrv_baseline)
+
+# Adjusted model (with PA)
+model_hrv_adj_pa <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + SHRZS_b + SHRZS_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- Extract smooth fits ----
+v_base_df_hrv <- predict_marginal_trajectory(model_hrv_baseline, data = df_month) %>% mutate(Model = "Baseline")
+v_adj_df_hrv  <- predict_marginal_trajectory(model_hrv_adj_pa,  data = df_month) %>% mutate(Model = "Adjusted")
+
+plot_df_hrv <- bind_rows(v_base_df_hrv, v_adj_df_hrv)
+
+# ---- Overlay plot (Figure 3g) ----
+p_fig3g <- ggplot(plot_df_hrv, aes(x = MONTH_NUM, y = visregFit, color = Model, fill = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(values = c("Baseline" = "black", "Adjusted" = "#1f78b4")) +
+  scale_fill_manual(values = c("Baseline" = "black", "Adjusted" = "#1f78b4")) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_fig3g
+
+# ---- Bootstrap attenuation ----
+att_hrv_pa <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_hrv_baseline,
+  formula_adj = HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + SHRZS_b + SHRZS_w
+)
+att_summary_hrv_pa <- summarize_attenuation(att_hrv_pa)
+```
+
+## Sleep
+### RHR
+```{r}
+# Reuse baseline RHR model from Aim 1 (model_rhr_baseline)
+
+# Adjusted model (with sleep)
+model_rhr_adj_sleep <- bam(
+  RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) +
+    s(AGE_2023) + GENDER + BMI + RHR_person_mean +
+    MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- Extract smooth fits ----
+v_base_df <- predict_marginal_trajectory(model_rhr_baseline, data = df_month) %>% mutate(Model = "Baseline")
+v_adj_df  <- predict_marginal_trajectory(model_rhr_adj_sleep, data = df_month) %>% mutate(Model = "Adjusted")
+
+plot_df <- bind_rows(v_base_df, v_adj_df)
+
+# ---- Overlay plot (Figure 3e) ----
+p_fig3e <- ggplot(plot_df, aes(x = MONTH_NUM, y = visregFit, color = Model, fill = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(values = c("Baseline" = "black", "Adjusted" = "darkorange")) +
+  scale_fill_manual(values = c("Baseline" = "black", "Adjusted" = "darkorange")) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_fig3e
+
+# ---- Bootstrap attenuation ----
+att_rhr_sleep <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_rhr_baseline,
+  formula_adj = RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + RHR_person_mean + MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w
+)
+att_summary_rhr_sleep <- summarize_attenuation(att_rhr_sleep)
+```
+### HRV
+```{r}
+# Reuse baseline HRV model from Aim 1 (model_hrv_baseline)
+
+# Adjusted model (with sleep)
+model_hrv_adj_sleep <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) +
+    s(AGE_2023) + GENDER + BMI + HRV_person_mean +
+    MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- Extract smooth fits ----
+v_base_df <- predict_marginal_trajectory(model_hrv_baseline, data = df_month) %>% mutate(Model = "Baseline")
+v_adj_df  <- predict_marginal_trajectory(model_hrv_adj_sleep, data = df_month) %>% mutate(Model = "Adjusted")
+
+plot_df <- bind_rows(v_base_df, v_adj_df)
+
+# ---- Overlay plot (Figure 3h) ----
+p_fig3h <- ggplot(plot_df, aes(x = MONTH_NUM, y = visregFit, color = Model, fill = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(values = c("Baseline" = "black", "Adjusted" = "darkorange")) +
+  scale_fill_manual(values = c("Baseline" = "black", "Adjusted" = "darkorange")) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_fig3h
+
+# ---- Bootstrap attenuation ----
+att_hrv_sleep <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_hrv_baseline,
+  formula_adj = HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w
+)
+att_summary_hrv_sleep <- summarize_attenuation(att_hrv_sleep)
+```
+
+# AIM 3
+### RHR
+```{r}
+# --- 1. Fit adjusted GAMM ---
+model_rhr_age_alladj <- bam(
+  RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET +
+    GENDER + BMI + RHR_person_mean +
+    SHRZS_b + SHRZS_w +
+    MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# --- 2. Extract smooths via marginal-trajectory helper ---
+v_rhr_df <- predict_marginal_trajectory(
+  model_rhr_age_alladj,
+  data = df_month,
+  by_var = "AGE_BUCKET"
+) %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+# Figure S5 panel A
+p_s5a <- ggplot(v_rhr_df, aes(x = MONTH_NUM, y = visregFit, color = AGE_BUCKET, fill = AGE_BUCKET)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(name = "Age Group", values = age_colors) +
+  scale_fill_manual(name = "Age Group", values = age_colors) +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = month.abb,
+    name = NULL
+  ) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s5a
+
+# ---- Bootstrap modeled amplitude by AGE_BUCKET (adjusted) ----
+formula_rhr_age_adj <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET +
+  GENDER + BMI + RHR_person_mean +
+  SHRZS_b + SHRZS_w +
+  MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w
+
+boot_rhr_age_adj <- bootstrap_amplitude(df_month, formula_rhr_age_adj, by = "AGE_BUCKET")
+
+bootstrap_summary_rhr <- boot_rhr_age_adj %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_rhr <- bootstrap_pairwise(boot_rhr_age_adj, "AGE_BUCKET")
+```
+### HRV
+```{r}
+model_hrv_age_alladj <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET +
+    GENDER + BMI + HRV_person_mean +
+    SHRZS_b + SHRZS_w +
+    MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+v_hrv_df <- predict_marginal_trajectory(
+  model_hrv_age_alladj,
+  data = df_month,
+  by_var = "AGE_BUCKET"
+) %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+# Figure S5 panel B
+p_s5b <- ggplot(v_hrv_df, aes(x = MONTH_NUM, y = visregFit, color = AGE_BUCKET, fill = AGE_BUCKET)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(name = "Age Group", values = age_colors) +
+  scale_fill_manual(name = "Age Group", values = age_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s5b
+
+# ---- Bootstrap modeled amplitude by AGE_BUCKET (adjusted) ----
+formula_hrv_age_adj <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET +
+  GENDER + BMI + HRV_person_mean +
+  SHRZS_b + SHRZS_w +
+  MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w
+
+boot_hrv_age_adj <- bootstrap_amplitude(df_month, formula_hrv_age_adj, by = "AGE_BUCKET")
+
+bootstrap_summary_hrv_adj <- boot_hrv_age_adj %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_adj <- bootstrap_pairwise(boot_hrv_age_adj, "AGE_BUCKET")
+```
+
+
+# AIM 4
+### AIM 4: Data Preparation (PA Tertiles + BMI Categories)
+```{r}
+# ---- 1. Add PA Tertiles to df_month (once; used by all PA analyses) ----
+# Tertile is computed at the user level (one row per user) and joined back, so
+# users whose SHRZS_b ties at a cutpoint are not split across two tertiles.
+df_month <- df_month %>%
+  select(-any_of("PA_TERTILE")) %>%
+  mutate(
+    AGE_BUCKET = as.factor(AGE_BUCKET),
+    GENDER = as.factor(GENDER)
+  )
+
+user_pa <- df_month %>%
+  distinct(USER_ID, SHRZS_b) %>%
+  mutate(PA_TERTILE = factor(ntile(SHRZS_b, 3),
+                             labels = c("Low", "Moderate", "High"))) %>%
+  select(USER_ID, PA_TERTILE)  # drop SHRZS_b before join to avoid .x/.y collision
+
+df_month <- df_month %>%
+  select(-any_of(c("SHRZS_b.x", "SHRZS_b.y", "PA_TERTILE.x", "PA_TERTILE.y"))) %>%
+  left_join(user_pa, by = "USER_ID")
+
+# Verification: cell counts should total 16,415 (one row per user)
+df_month %>%
+  distinct(USER_ID, AGE_BUCKET, PA_TERTILE) %>%
+  count(AGE_BUCKET, PA_TERTILE)
+
+# ---- 2. Create df_month_bmi (separate copy; preserves df_month intact) ----
+# Underweight (BMI < 18.5) and missing-BMI participants receive NA from
+# case_when() and are dropped via drop_na() below.
+df_month_bmi <- df_month %>%
+  mutate(
+    BMI_CATEGORY = case_when(
+      BMI >= 18.5 & BMI < 25 ~ "Normal",
+      BMI >= 25 & BMI < 30 ~ "Overweight",
+      BMI >= 30 ~ "Obese"
+    ),
+    BMI_CATEGORY = factor(BMI_CATEGORY, levels = c("Normal", "Overweight", "Obese"))
+  ) %>%
+  drop_na(BMI_CATEGORY)
+```
+
+### RHR Moderation by Activity: All
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by PA_TERTILE ----
+formula_rhr_pa_all <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = PA_TERTILE) +
+  PA_TERTILE + s(AGE_2023) + GENDER + BMI + RHR_person_mean
+
+model_rhr_pa_all <- bam(
+  formula_rhr_pa_all,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_pa_all <- predict_marginal_trajectory(
+  model_rhr_pa_all,
+  data = df_month,
+  by_var = "PA_TERTILE"
+)
+
+# ---- 4. Plot ----
+p_fig4a <- ggplot(v_df_pa_all, aes(x = MONTH_NUM, y = visregFit, color = PA_TERTILE, fill = PA_TERTILE)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Activity Group", values = pa_colors) +
+  scale_fill_manual(name = "Activity Group", values = pa_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_fig4a
+
+# ---- 5. Bootstrap amplitude + pairwise ----
+boot_rhr_pa_all <- bootstrap_amplitude(df_month, formula_rhr_pa_all, by = "PA_TERTILE")
+
+bootstrap_summary_pa_all <- boot_rhr_pa_all %>%
+  group_by(PA_TERTILE) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_pa_all <- bootstrap_pairwise(boot_rhr_pa_all, "PA_TERTILE")
+```
+
+### HRV Moderation by Activity: All
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by PA_TERTILE ----
+formula_hrv_pa_all <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = PA_TERTILE) +
+  PA_TERTILE + s(AGE_2023) + GENDER + BMI + HRV_person_mean
+
+model_hrv_pa_all <- bam(
+  formula_hrv_pa_all,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_hrv_pa_all <- predict_marginal_trajectory(
+  model_hrv_pa_all,
+  data = df_month,
+  by_var = "PA_TERTILE"
+)
+
+# ---- 4. Plot ----
+p_fig4b <- ggplot(v_df_hrv_pa_all, aes(x = MONTH_NUM, y = visregFit, color = PA_TERTILE, fill = PA_TERTILE)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Activity Group", values = pa_colors) +
+  scale_fill_manual(name = "Activity Group", values = pa_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_fig4b
+
+# ---- 5. Bootstrap amplitude + pairwise ----
+boot_hrv_pa_all <- bootstrap_amplitude(df_month, formula_hrv_pa_all, by = "PA_TERTILE")
+
+bootstrap_summary_hrv_pa_all <- boot_hrv_pa_all %>%
+  group_by(PA_TERTILE) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_pa_all <- bootstrap_pairwise(boot_hrv_pa_all, "PA_TERTILE")
+```
+
+### RHR Moderation by BMI: All
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by BMI_CATEGORY (uses df_month_bmi) ----
+formula_rhr_bmi_all <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+  BMI_CATEGORY + s(AGE_2023) + SHRZS_b + SHRZS_w + GENDER + RHR_person_mean
+
+model_rhr_bmi_all <- bam(
+  formula_rhr_bmi_all,
+  data = df_month_bmi,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_bmi_all <- predict_marginal_trajectory(
+  model_rhr_bmi_all,
+  data = df_month_bmi,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 4. Plot ----
+p_fig4c <- ggplot(v_df_bmi_all, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_fig4c
+
+# ---- 5. Bootstrap amplitude + pairwise (formula matches primary model) ----
+boot_rhr_bmi_all <- bootstrap_amplitude(df_month_bmi, formula_rhr_bmi_all, by = "BMI_CATEGORY")
+
+bootstrap_summary_bmi_all <- boot_rhr_bmi_all %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_bmi_all <- bootstrap_pairwise(boot_rhr_bmi_all, "BMI_CATEGORY")
+```
+
+### HRV Moderation by BMI: All
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by BMI_CATEGORY (uses df_month_bmi) ----
+formula_hrv_bmi_all <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+  BMI_CATEGORY + s(AGE_2023) + SHRZS_b + SHRZS_w + GENDER + HRV_person_mean
+
+model_hrv_bmi_all <- bam(
+  formula_hrv_bmi_all,
+  data = df_month_bmi,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_hrv_bmi_all <- predict_marginal_trajectory(
+  model_hrv_bmi_all,
+  data = df_month_bmi,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 4. Plot ----
+p_fig4d <- ggplot(v_df_hrv_bmi_all, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_fig4d
+
+# ---- 5. Bootstrap amplitude + pairwise (formula matches primary model) ----
+boot_hrv_bmi_all <- bootstrap_amplitude(df_month_bmi, formula_hrv_bmi_all, by = "BMI_CATEGORY")
+
+bootstrap_summary_hrv_bmi_all <- boot_hrv_bmi_all %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_bmi_all <- bootstrap_pairwise(boot_hrv_bmi_all, "BMI_CATEGORY")
+```
+
+
+### Geographic Daylight Amplitude: Regression + Figures
+```{r}
+# State-centroid latitudes (built-in to base R)
+state_lat <- tibble::tibble(STATE = state.abb, LAT = state.center$y)
+
+# Solar declination + daylight hours from latitude (degrees N) and day-of-year
+solar_declination <- function(d) asin(0.39795 * cos(0.98563 * pi/180 * (d - 173)))
+daylight_hours <- function(lat_deg, day_of_year) {
+  phi   <- lat_deg * pi/180
+  delta <- solar_declination(day_of_year)
+  H     <- acos(pmin(pmax((-0.01454 - sin(phi) * sin(delta)) / (cos(phi) * cos(delta)),
+                          -1), 1))
+  2 * H * 180/pi / 15
+}
+
+# Annual daylight amplitude = summer solstice (day 173) − winter solstice (day 355)
+state_lat <- state_lat %>%
+  mutate(DAYLIGHT_AMP = daylight_hours(LAT, 173) - daylight_hours(LAT, 355))
+
+# ---- User-level Aug/Dec amplitudes joined to daylight amplitude (RHR) ----
+df_amp_rhr_lat <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(SEASON = ifelse(MONTH_NUM == 8, "August", "December")) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_val = mean(RHR_within, na.rm = TRUE),
+    STATE = first(na.omit(STATE)),
+    AGE_2023 = first(AGE_2023),
+    GENDER = first(GENDER),
+    BMI = first(BMI),
+    RHR_person_mean = first(RHR_person_mean),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_val) %>%
+  mutate(amplitude = December - August) %>%
+  left_join(state_lat, by = "STATE") %>%
+  drop_na(DAYLIGHT_AMP, amplitude)
+
+# ---- User-level Aug/Dec amplitudes joined to daylight amplitude (HRV) ----
+df_amp_hrv_lat <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(SEASON = ifelse(MONTH_NUM == 8, "August", "December")) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_val = mean(HRV_within, na.rm = TRUE),
+    STATE = first(na.omit(STATE)),
+    AGE_2023 = first(AGE_2023),
+    GENDER = first(GENDER),
+    BMI = first(BMI),
+    HRV_person_mean = first(HRV_person_mean),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_val) %>%
+  mutate(amplitude = August - December) %>%
+  left_join(state_lat, by = "STATE") %>%
+  drop_na(DAYLIGHT_AMP, amplitude)
+
+# ---- Linear regressions: amplitude ~ annual daylight amplitude + covariates ----
+model_rhr_daylight <- lm(amplitude ~ DAYLIGHT_AMP + AGE_2023 + GENDER + BMI + RHR_person_mean,
+                         data = df_amp_rhr_lat)
+model_hrv_daylight <- lm(amplitude ~ DAYLIGHT_AMP + AGE_2023 + GENDER + BMI + HRV_person_mean,
+                         data = df_amp_hrv_lat)
+
+# Extract daylight-amplitude coefficient, CI, and p-value for reporting
+daylight_results <- tibble::tibble(
+  Outcome       = c("RHR", "HRV"),
+  beta_daylight = c(coef(model_rhr_daylight)["DAYLIGHT_AMP"],
+                    coef(model_hrv_daylight)["DAYLIGHT_AMP"]),
+  ci_low        = c(confint(model_rhr_daylight)["DAYLIGHT_AMP", 1],
+                    confint(model_hrv_daylight)["DAYLIGHT_AMP", 1]),
+  ci_high       = c(confint(model_rhr_daylight)["DAYLIGHT_AMP", 2],
+                    confint(model_hrv_daylight)["DAYLIGHT_AMP", 2]),
+  p_value       = c(summary(model_rhr_daylight)$coefficients["DAYLIGHT_AMP", "Pr(>|t|)"],
+                    summary(model_hrv_daylight)$coefficients["DAYLIGHT_AMP", "Pr(>|t|)"]),
+  n             = c(nrow(df_amp_rhr_lat), nrow(df_amp_hrv_lat))
+)
+print(daylight_results)
+
+# ---- Sensitivity: cluster-robust SEs by state ----
+# DAYLIGHT_AMP is identical for all users in a state, so OLS treats clustered
+# observations as independent. Cluster-robust standard errors (sandwich
+# estimator) account for within-state correlation without imposing
+# distributional assumptions on state-level effects.
+library(sandwich)
+library(lmtest)
+
+vcov_cluster_rhr <- vcovCL(model_rhr_daylight, cluster = ~ STATE)
+vcov_cluster_hrv <- vcovCL(model_hrv_daylight, cluster = ~ STATE)
+
+coeftest_rhr_cluster <- coeftest(model_rhr_daylight, vcov = vcov_cluster_rhr)
+coeftest_hrv_cluster <- coeftest(model_hrv_daylight, vcov = vcov_cluster_hrv)
+
+ci_rhr_cluster <- coefci(model_rhr_daylight, vcov = vcov_cluster_rhr)
+ci_hrv_cluster <- coefci(model_hrv_daylight, vcov = vcov_cluster_hrv)
+
+daylight_results_cluster <- tibble::tibble(
+  Outcome       = c("RHR", "HRV"),
+  beta_daylight = c(coef(model_rhr_daylight)["DAYLIGHT_AMP"],
+                    coef(model_hrv_daylight)["DAYLIGHT_AMP"]),
+  ci_low        = c(ci_rhr_cluster["DAYLIGHT_AMP", 1],
+                    ci_hrv_cluster["DAYLIGHT_AMP", 1]),
+  ci_high       = c(ci_rhr_cluster["DAYLIGHT_AMP", 2],
+                    ci_hrv_cluster["DAYLIGHT_AMP", 2]),
+  p_value       = c(coeftest_rhr_cluster["DAYLIGHT_AMP", "Pr(>|t|)"],
+                    coeftest_hrv_cluster["DAYLIGHT_AMP", "Pr(>|t|)"]),
+  n_users       = c(nrow(df_amp_rhr_lat), nrow(df_amp_hrv_lat)),
+  n_states      = c(length(unique(df_amp_rhr_lat$STATE)), length(unique(df_amp_hrv_lat$STATE)))
+)
+print(daylight_results_cluster)
+
+# Side-by-side comparison: OLS vs cluster-robust SEs (same coefficients, different SEs)
+daylight_comparison <- bind_rows(
+  daylight_results            %>% select(Outcome, beta_daylight, ci_low, ci_high, p_value) %>% mutate(SE_method = "OLS"),
+  daylight_results_cluster    %>% select(Outcome, beta_daylight, ci_low, ci_high, p_value) %>% mutate(SE_method = "Cluster-robust (state)")
+) %>%
+  select(SE_method, Outcome, beta_daylight, ci_low, ci_high, p_value)
+print(daylight_comparison)
+
+# ---- State-level summaries for plotting (one point per state, sized by n) ----
+state_summary_rhr <- df_amp_rhr_lat %>%
+  group_by(STATE, DAYLIGHT_AMP) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE),
+            n_users = dplyr::n(), .groups = "drop")
+
+state_summary_hrv <- df_amp_hrv_lat %>%
+  group_by(STATE, DAYLIGHT_AMP) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE),
+            n_users = dplyr::n(), .groups = "drop")
+
+# ---- Cluster-robust prediction grids for plotting ----
+# Build prediction grids with DAYLIGHT_AMP varying and other covariates at
+# sample means (GENDER at reference level "male"). Cluster-robust pointwise
+# SEs computed via X %*% vcovCL %*% X'.
+
+# RHR
+pred_rhr <- data.frame(
+  DAYLIGHT_AMP    = seq(min(df_amp_rhr_lat$DAYLIGHT_AMP),
+                        max(df_amp_rhr_lat$DAYLIGHT_AMP), length.out = 200),
+  AGE_2023        = mean(df_amp_rhr_lat$AGE_2023, na.rm = TRUE),
+  GENDER          = factor(levels(df_amp_rhr_lat$GENDER)[1],
+                           levels = levels(df_amp_rhr_lat$GENDER)),
+  BMI             = mean(df_amp_rhr_lat$BMI, na.rm = TRUE),
+  RHR_person_mean = mean(df_amp_rhr_lat$RHR_person_mean, na.rm = TRUE)
+)
+X_rhr <- model.matrix(~ DAYLIGHT_AMP + AGE_2023 + GENDER + BMI + RHR_person_mean,
+                      data = pred_rhr)
+pred_rhr$fit <- as.vector(X_rhr %*% coef(model_rhr_daylight))
+pred_rhr$se  <- sqrt(diag(X_rhr %*% vcov_cluster_rhr %*% t(X_rhr)))
+pred_rhr$lwr <- pred_rhr$fit - 1.96 * pred_rhr$se
+pred_rhr$upr <- pred_rhr$fit + 1.96 * pred_rhr$se
+
+# HRV
+pred_hrv <- data.frame(
+  DAYLIGHT_AMP    = seq(min(df_amp_hrv_lat$DAYLIGHT_AMP),
+                        max(df_amp_hrv_lat$DAYLIGHT_AMP), length.out = 200),
+  AGE_2023        = mean(df_amp_hrv_lat$AGE_2023, na.rm = TRUE),
+  GENDER          = factor(levels(df_amp_hrv_lat$GENDER)[1],
+                           levels = levels(df_amp_hrv_lat$GENDER)),
+  BMI             = mean(df_amp_hrv_lat$BMI, na.rm = TRUE),
+  HRV_person_mean = mean(df_amp_hrv_lat$HRV_person_mean, na.rm = TRUE)
+)
+X_hrv <- model.matrix(~ DAYLIGHT_AMP + AGE_2023 + GENDER + BMI + HRV_person_mean,
+                      data = pred_hrv)
+pred_hrv$fit <- as.vector(X_hrv %*% coef(model_hrv_daylight))
+pred_hrv$se  <- sqrt(diag(X_hrv %*% vcov_cluster_hrv %*% t(X_hrv)))
+pred_hrv$lwr <- pred_hrv$fit - 1.96 * pred_hrv$se
+pred_hrv$upr <- pred_hrv$fit + 1.96 * pred_hrv$se
+
+# ---- Figure S5A (saved as S5; internal name p_s9a per creation order) ----
+# Caption note: points are state-level means (sized by n users); regression
+# line and 95% CI are from a user-level model with state-clustered SEs.
+p_s9a <- ggplot(state_summary_rhr, aes(x = DAYLIGHT_AMP, y = mean_amp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  geom_ribbon(data = pred_rhr, aes(x = DAYLIGHT_AMP, ymin = lwr, ymax = upr),
+              fill = "#D62728", alpha = 0.25, inherit.aes = FALSE) +
+  geom_line(data = pred_rhr, aes(x = DAYLIGHT_AMP, y = fit),
+            color = "#D62728", linewidth = 1, inherit.aes = FALSE) +
+  geom_point(aes(size = n_users), alpha = 0.75, color = "gray25") +
+  scale_size_continuous(name = "N per State", range = c(1.5, 8)) +
+  scale_x_continuous(name = "Annual Daylight Amplitude (h)") +
+  scale_y_continuous(name = "RHR Amplitude (Dec − Aug, bpm)") +
+  theme_seasonality()
+p_s9a
+
+# ---- Figure S5B (saved as S5; internal name p_s9b per creation order) ----
+p_s9b <- ggplot(state_summary_hrv, aes(x = DAYLIGHT_AMP, y = mean_amp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  geom_ribbon(data = pred_hrv, aes(x = DAYLIGHT_AMP, ymin = lwr, ymax = upr),
+              fill = "#1F77B4", alpha = 0.25, inherit.aes = FALSE) +
+  geom_line(data = pred_hrv, aes(x = DAYLIGHT_AMP, y = fit),
+            color = "#1F77B4", linewidth = 1, inherit.aes = FALSE) +
+  geom_point(aes(size = n_users), alpha = 0.75, color = "gray25") +
+  scale_size_continuous(name = "N per State", range = c(1.5, 8)) +
+  scale_x_continuous(name = "Annual Daylight Amplitude (h)") +
+  scale_y_continuous(name = "HRV Amplitude (Aug − Dec, ms)") +
+  theme_seasonality()
+p_s9b
+```
+
+
+### Old Adults: Create Subsets
+```{r}
+# ---- Create df_old ONCE (PA analyses) ----
+df_old <- df_month %>%
+  filter(AGE_BUCKET == "Old")
+
+# ---- Create df_old_bmi ONCE (BMI analyses) ----
+df_old_bmi <- df_month_bmi %>%
+  filter(AGE_BUCKET == "Old")
+```
+
+### RHR Moderation by Activity: Old
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by PA_TERTILE ----
+formula_rhr_pa_old <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = PA_TERTILE) +
+  PA_TERTILE + GENDER + BMI + RHR_person_mean
+
+model_rhr_pa_old <- bam(
+  formula_rhr_pa_old,
+  data = df_old,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_pa <- predict_marginal_trajectory(
+  model_rhr_pa_old,
+  data = df_old,
+  by_var = "PA_TERTILE"
+)
+
+# ---- 5. Plot ----
+p_s8_rhr_pa <- ggplot(v_df_pa, aes(x = MONTH_NUM, y = visregFit, color = PA_TERTILE, fill = PA_TERTILE)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Activity Group", values = pa_colors) +
+  scale_fill_manual(name = "Activity Group", values = pa_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s8_rhr_pa
+
+# ---- 6. Bootstrap amplitude + pairwise ----
+boot_rhr_pa_old <- bootstrap_amplitude(df_old, formula_rhr_pa_old, by = "PA_TERTILE")
+
+bootstrap_summary_pa_old <- boot_rhr_pa_old %>%
+  group_by(PA_TERTILE) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_pa_old <- bootstrap_pairwise(boot_rhr_pa_old, "PA_TERTILE")
+
+# ---- 7. Plot Bootstrapped Amplitude by PA_TERTILE ----
+bootstrap_summary_pa_old$PA_TERTILE <- factor(bootstrap_summary_pa_old$PA_TERTILE, levels = c("Low", "Moderate", "High"))
+
+p_s8_rhr_pa_amp <- ggplot(bootstrap_summary_pa_old, aes(x = PA_TERTILE, y = mean_amp, fill = PA_TERTILE)) +
+  geom_col(width = 0.6, color = "black", alpha = 0.8) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2, linewidth = 1.1) +
+  scale_fill_manual(values = pa_colors) +
+  labs(
+    x = "Physical Activity Tertile (Older Adults)",
+    y = "Modeled RHR Amplitude (bpm)"
+  ) +
+  theme_seasonality(legend = FALSE)
+p_s8_rhr_pa_amp
+```
+
+### HRV Moderation by Activity: Old
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by PA_TERTILE ----
+formula_hrv_pa_old <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = PA_TERTILE) +
+  PA_TERTILE + GENDER + BMI + HRV_person_mean
+
+model_hrv_pa_old <- bam(
+  formula_hrv_pa_old,
+  data = df_old,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_hrv <- predict_marginal_trajectory(
+  model_hrv_pa_old,
+  data = df_old,
+  by_var = "PA_TERTILE"
+)
+
+# ---- 5. Plot ----
+p_s8_hrv_pa <- ggplot(v_df_hrv, aes(x = MONTH_NUM, y = visregFit, color = PA_TERTILE, fill = PA_TERTILE)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Activity Group", values = pa_colors) +
+  scale_fill_manual(name = "Activity Group", values = pa_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s8_hrv_pa
+
+# ---- 6. Bootstrap amplitude + pairwise ----
+boot_hrv_pa_old <- bootstrap_amplitude(df_old, formula_hrv_pa_old, by = "PA_TERTILE")
+
+bootstrap_summary_hrv_pa_old <- boot_hrv_pa_old %>%
+  group_by(PA_TERTILE) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_pa_old <- bootstrap_pairwise(boot_hrv_pa_old, "PA_TERTILE")
+```
+
+### RHR Moderation by BMI: Old
+```{r}
+df_old_bmi %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(n_users = n_distinct(USER_ID), .groups = "drop")
+
+# ---- 2. Fit GAMM with cyclic spline by BMI_CATEGORY ----
+formula_rhr_bmi_old <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+  BMI_CATEGORY + GENDER + SHRZS_b + SHRZS_w + RHR_person_mean
+
+model_rhr_bmi_old <- bam(
+  formula_rhr_bmi_old,
+  data = df_old_bmi,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 3. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_bmi <- predict_marginal_trajectory(
+  model_rhr_bmi_old,
+  data = df_old_bmi,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 4. Plot ----
+p_s8_rhr_bmi <- ggplot(v_df_bmi, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s8_rhr_bmi
+
+# ---- 5. Bootstrap amplitude + pairwise (formula matches primary model) ----
+boot_rhr_bmi_old <- bootstrap_amplitude(df_old_bmi, formula_rhr_bmi_old, by = "BMI_CATEGORY")
+
+bootstrap_summary_bmi_old <- boot_rhr_bmi_old %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_bmi_old <- bootstrap_pairwise(boot_rhr_bmi_old, "BMI_CATEGORY")
+```
+
+### RHR Moderation by BMI: Old (Plotting Only; No Overweight)
+```{r}
+df_old_bmi_no <- df_old_bmi %>%
+  filter(BMI_CATEGORY %in% c("Normal", "Obese")) %>%
+  mutate(BMI_CATEGORY = factor(BMI_CATEGORY, levels = c("Normal", "Obese")))
+
+# Fit GAMM with cyclic spline by BMI_CATEGORY
+model_rhr_bmi_noow <- bam(
+  RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+    BMI_CATEGORY + GENDER + SHRZS_b + SHRZS_w + BMI + RHR_person_mean,
+  data = df_old_bmi_no,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# Marginal trajectory (averages over GENDER; lpmatrix-based SE)
+v_df_bmi_noow <- predict_marginal_trajectory(
+  model_rhr_bmi_noow,
+  data = df_old_bmi_no,
+  by_var = "BMI_CATEGORY"
+)
+
+# Plot
+p_s8_rhr_bmi_noow <- ggplot(v_df_bmi_noow, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors[c("Normal", "Obese")]) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors[c("Normal", "Obese")]) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s8_rhr_bmi_noow
+```
+
+### HRV Moderation by BMI: Old
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by BMI_CATEGORY (reuses df_old_bmi) ----
+formula_hrv_bmi_old <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+  BMI_CATEGORY + GENDER + SHRZS_b + SHRZS_w + HRV_person_mean
+
+model_hrv_bmi_old <- bam(
+  formula_hrv_bmi_old,
+  data = df_old_bmi,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_hrv_bmi <- predict_marginal_trajectory(
+  model_hrv_bmi_old,
+  data = df_old_bmi,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 3. Plot ----
+p_s8_hrv_bmi <- ggplot(v_df_hrv_bmi, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s8_hrv_bmi
+
+# ---- 4. Bootstrap amplitude + pairwise (formula matches primary model) ----
+boot_hrv_bmi_old <- bootstrap_amplitude(df_old_bmi, formula_hrv_bmi_old, by = "BMI_CATEGORY")
+
+bootstrap_summary_hrv_bmi_old <- boot_hrv_bmi_old %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_bmi_old <- bootstrap_pairwise(boot_hrv_bmi_old, "BMI_CATEGORY")
+```
+
+### HRV Moderation by BMI: Old (Plotting Only; No Overweight)
+```{r}
+# ---- Fit GAMM with cyclic spline by BMI_CATEGORY (reuses df_old_bmi_no from RHR section) ----
+model_hrv_bmi_noow <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+    BMI_CATEGORY + GENDER + BMI + HRV_person_mean,
+  data = df_old_bmi_no,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 3. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_hrv_bmi_noow <- predict_marginal_trajectory(
+  model_hrv_bmi_noow,
+  data = df_old_bmi_no,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 4. Plot ----
+p_s8_hrv_bmi_noow <- ggplot(v_df_hrv_bmi_noow, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors[c("Normal", "Obese")]) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors[c("Normal", "Obese")]) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s8_hrv_bmi_noow
+```
+### RHR Box-And-Whisker and LMM by BMI Category: Old
+```{r}
+df_old_bmi_aug_dec <- df_old_bmi %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(
+    MONTH_LABEL = factor(ifelse(MONTH_NUM == 8, "August", "December"), levels = c("August", "December")),
+    pattern = ifelse(MONTH_LABEL == "December", "stripe", "none")
+  )
+
+# Boxplot
+p_s8_rhr_bmi_box <- ggplot(df_old_bmi_aug_dec, aes(x = BMI_CATEGORY, y = RESTING_HEART_RATE)) +
+  geom_boxplot_pattern(
+    aes(
+      fill = BMI_CATEGORY,
+      pattern = MONTH_LABEL,
+      pattern_fill = BMI_CATEGORY
+    ),
+    position = position_dodge(width = 0.75),
+    color = "black",
+    pattern_density = 0.4,
+    pattern_spacing = 0.05,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    aes(group = interaction(MONTH_LABEL, BMI_CATEGORY)),
+    position = position_dodge(width = 0.75),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black"
+  ) +
+  scale_fill_manual(values = bmi_colors) +
+  scale_pattern_fill_manual(values = bmi_colors) +
+  scale_pattern_manual(
+    values = c("August" = "none", "December" = "stripe"),
+    name = "Month"
+  ) +
+  guides(
+    fill = "none",
+    pattern_fill = "none"
+  ) +
+  labs(
+    x = "BMI Category",
+    y = "Resting Heart Rate (bpm)"
+  ) +
+  theme_seasonality()
+p_s8_rhr_bmi_box
+
+# LMM for RHR with BMI_CATEGORY * MONTH_LABEL interaction
+model_old_rhr_bmi <- lmer(
+  RESTING_HEART_RATE ~ BMI_CATEGORY * MONTH_LABEL + PA_TERTILE + GENDER + RHR_person_mean + (1 | USER_ID),
+  data = df_old_bmi_aug_dec
+)
+
+anova(model_old_rhr_bmi)
+
+emmeans(model_old_rhr_bmi, pairwise ~ BMI_CATEGORY | MONTH_LABEL, adjust = "holm")
+emmeans(model_old_rhr_bmi, pairwise ~ MONTH_LABEL | BMI_CATEGORY, adjust = "holm")
+```
+### HRV Box-And-Whisker and LMM by BMI Category: Old
+```{r}
+# Reuse df_old_bmi_aug_dec from prior chunk
+
+p_s8_hrv_bmi_box <- ggplot(df_old_bmi_aug_dec, aes(x = BMI_CATEGORY, y = HRV)) +
+  geom_boxplot_pattern(
+    aes(
+      fill = BMI_CATEGORY,
+      pattern = MONTH_LABEL,
+      pattern_fill = BMI_CATEGORY
+    ),
+    position = position_dodge(width = 0.75),
+    color = "black",
+    pattern_density = 0.4,
+    pattern_spacing = 0.05,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    aes(group = interaction(MONTH_LABEL, BMI_CATEGORY)),
+    position = position_dodge(width = 0.75),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black"
+  ) +
+  scale_fill_manual(values = bmi_colors) +
+  scale_pattern_fill_manual(values = bmi_colors) +
+  scale_pattern_manual(
+    values = c("August" = "none", "December" = "stripe"),
+    name = "Month"
+  ) +
+  guides(
+    fill = "none",
+    pattern_fill = "none"
+  ) +
+  labs(
+    x = "BMI Category",
+    y = "HRV (ms)"
+  ) +
+  coord_cartesian(ylim = c(0, 150)) +
+  theme_seasonality()
+p_s8_hrv_bmi_box
+
+model_old_hrv_bmi <- lmer(
+  HRV ~ BMI_CATEGORY * MONTH_LABEL + GENDER + PA_TERTILE + HRV_person_mean + (1 | USER_ID),
+  data = df_old_bmi_aug_dec
+)
+
+anova(model_old_hrv_bmi)
+emmeans(model_old_hrv_bmi, pairwise ~ BMI_CATEGORY | MONTH_LABEL, adjust = "holm")
+emmeans(model_old_hrv_bmi, pairwise ~ MONTH_LABEL | BMI_CATEGORY, adjust = "holm")
+
+```
+### Means+/-SD in BMI categories: Old
+```{r}
+df_old_bmi %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    n_users = n_distinct(USER_ID),
+    mean_BMI = mean(BMI, na.rm = TRUE),
+    sd_BMI = sd(BMI, na.rm = TRUE),
+    mean_AGE_2023 = mean(AGE_2023, na.rm = TRUE),
+    sd_AGE_2023 = sd(AGE_2023, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### Middle-Aged Adults: Create Subsets
+```{r}
+# ---- Create df_mid ONCE (PA analyses) ----
+# Inherits whole-sample, user-level PA_TERTILE from df_month (lines 2504-2509)
+# so Low/Moderate/High refer to the same absolute activity levels across all
+# age strata (df_old, df_mid, df_young).
+df_mid <- df_month %>%
+  filter(AGE_BUCKET == "Middle")
+
+# ---- Create df_mid_bmi ONCE (BMI analyses) ----
+df_mid_bmi <- df_month_bmi %>%
+  filter(AGE_BUCKET == "Middle")
+```
+
+### RHR Moderation by Activity: Middle
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by PA_TERTILE ----
+formula_rhr_pa_mid <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = PA_TERTILE) +
+  PA_TERTILE + GENDER + BMI + RHR_person_mean
+
+model_rhr_pa_mid <- bam(
+  formula_rhr_pa_mid,
+  data = df_mid,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_pa <- predict_marginal_trajectory(
+  model_rhr_pa_mid,
+  data = df_mid,
+  by_var = "PA_TERTILE"
+)
+
+# ---- 3. Plot (Figure S7: RHR by PA, Middle-Aged) ----
+p_s7_rhr_pa <- ggplot(v_df_pa, aes(x = MONTH_NUM, y = visregFit, color = PA_TERTILE, fill = PA_TERTILE)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Activity Group", values = pa_colors) +
+  scale_fill_manual(name = "Activity Group", values = pa_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s7_rhr_pa
+
+# ---- 4. Bootstrap amplitude + pairwise ----
+boot_rhr_pa_mid <- bootstrap_amplitude(df_mid, formula_rhr_pa_mid, by = "PA_TERTILE")
+
+bootstrap_summary_pa_mid <- boot_rhr_pa_mid %>%
+  group_by(PA_TERTILE) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_pa_mid <- bootstrap_pairwise(boot_rhr_pa_mid, "PA_TERTILE")
+```
+
+### HRV Moderation by Activity: Middle
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by PA_TERTILE ----
+formula_hrv_pa_mid <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = PA_TERTILE) +
+  PA_TERTILE + GENDER + BMI + HRV_person_mean
+
+model_hrv_pa_mid <- bam(
+  formula_hrv_pa_mid,
+  data = df_mid,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_pa_hrv <- predict_marginal_trajectory(
+  model_hrv_pa_mid,
+  data = df_mid,
+  by_var = "PA_TERTILE"
+)
+
+# ---- 3. Plot (Figure S7: HRV by PA, Middle-Aged) ----
+p_s7_hrv_pa <- ggplot(v_df_pa_hrv, aes(x = MONTH_NUM, y = visregFit, color = PA_TERTILE, fill = PA_TERTILE)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Activity Group", values = pa_colors) +
+  scale_fill_manual(name = "Activity Group", values = pa_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s7_hrv_pa
+
+# ---- 4. Bootstrap amplitude + pairwise ----
+boot_hrv_pa_mid <- bootstrap_amplitude(df_mid, formula_hrv_pa_mid, by = "PA_TERTILE")
+
+bootstrap_summary_hrv_pa_mid <- boot_hrv_pa_mid %>%
+  group_by(PA_TERTILE) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_pa_mid <- bootstrap_pairwise(boot_hrv_pa_mid, "PA_TERTILE")
+```
+
+### RHR Moderation by BMI: Middle
+```{r}
+# ---- 1. Sample sizes by BMI group ----
+df_mid_bmi %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(n_users = n_distinct(USER_ID), .groups = "drop")
+
+# ---- 2. Fit GAMM with cyclic spline by BMI_CATEGORY ----
+formula_rhr_bmi_mid <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+  BMI_CATEGORY + GENDER + SHRZS_b + SHRZS_w + RHR_person_mean
+
+model_rhr_bmi_mid <- bam(
+  formula_rhr_bmi_mid,
+  data = df_mid_bmi,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 3. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_bmi_mid <- predict_marginal_trajectory(
+  model_rhr_bmi_mid,
+  data = df_mid_bmi,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 4. Plot (Figure S7: RHR by BMI, Middle-Aged) ----
+p_s7_rhr_bmi <- ggplot(v_df_bmi_mid, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s7_rhr_bmi
+
+# ---- 5. Bootstrap amplitude + pairwise (formula matches primary model) ----
+boot_rhr_bmi_mid <- bootstrap_amplitude(df_mid_bmi, formula_rhr_bmi_mid, by = "BMI_CATEGORY")
+
+bootstrap_summary_bmi_mid <- boot_rhr_bmi_mid %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_bmi_mid <- bootstrap_pairwise(boot_rhr_bmi_mid, "BMI_CATEGORY")
+```
+
+### HRV Moderation by BMI: Middle
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by BMI_CATEGORY ----
+formula_hrv_bmi_mid <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+  BMI_CATEGORY + GENDER + SHRZS_b + SHRZS_w + HRV_person_mean
+
+model_hrv_bmi_mid <- bam(
+  formula_hrv_bmi_mid,
+  data = df_mid_bmi,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_bmi_mid <- predict_marginal_trajectory(
+  model_hrv_bmi_mid,
+  data = df_mid_bmi,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 3. Plot (Figure S7: HRV by BMI, Middle-Aged) ----
+p_s7_hrv_bmi <- ggplot(v_df_bmi_mid, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s7_hrv_bmi
+
+# ---- 4. Bootstrap amplitude + pairwise (formula matches primary model) ----
+boot_hrv_bmi_mid <- bootstrap_amplitude(df_mid_bmi, formula_hrv_bmi_mid, by = "BMI_CATEGORY")
+
+bootstrap_summary_hrv_bmi_mid <- boot_hrv_bmi_mid %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_bmi_mid <- bootstrap_pairwise(boot_hrv_bmi_mid, "BMI_CATEGORY")
+```
+
+
+### Young Adults: Create Subsets
+```{r}
+# ---- Create df_young ONCE (PA analyses) ----
+df_young <- df_month %>%
+  filter(AGE_BUCKET == "Young")
+
+# ---- Create df_young_bmi ONCE (BMI analyses) ----
+df_young_bmi <- df_month_bmi %>%
+  filter(AGE_BUCKET == "Young")
+```
+
+### RHR Moderation by Activity: Young
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by PA_TERTILE ----
+formula_rhr_pa_young <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = PA_TERTILE) +
+  PA_TERTILE + GENDER + BMI + RHR_person_mean
+
+model_rhr_pa_y <- bam(
+  formula_rhr_pa_young,
+  data = df_young,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_pa_y <- predict_marginal_trajectory(
+  model_rhr_pa_y,
+  data = df_young,
+  by_var = "PA_TERTILE"
+)
+
+# ---- 3. Plot ----
+p_s6_rhr_pa <- ggplot(v_df_pa_y, aes(x = MONTH_NUM, y = visregFit, color = PA_TERTILE, fill = PA_TERTILE)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Activity Group", values = pa_colors) +
+  scale_fill_manual(name = "Activity Group", values = pa_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s6_rhr_pa
+
+# ---- 4. Bootstrap amplitude + pairwise ----
+boot_rhr_pa_young <- bootstrap_amplitude(df_young, formula_rhr_pa_young, by = "PA_TERTILE")
+
+bootstrap_summary_pa_y <- boot_rhr_pa_young %>%
+  group_by(PA_TERTILE) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_pa_y <- bootstrap_pairwise(boot_rhr_pa_young, "PA_TERTILE")
+
+# ---- 5. Plot Bootstrapped Amplitude by PA_TERTILE ----
+bootstrap_summary_pa_y$PA_TERTILE <- factor(bootstrap_summary_pa_y$PA_TERTILE, levels = c("Low", "Moderate", "High"))
+
+p_s6_rhr_pa_amp <- ggplot(bootstrap_summary_pa_y, aes(x = PA_TERTILE, y = mean_amp, fill = PA_TERTILE)) +
+  geom_col(width = 0.6, color = "black", alpha = 0.8) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2, linewidth = 1.1) +
+  scale_fill_manual(values = pa_colors) +
+  labs(
+    x = "Physical Activity Tertile (Young Adults)",
+    y = "Modeled RHR Amplitude (bpm)"
+  ) +
+  theme_seasonality(legend = FALSE)
+p_s6_rhr_pa_amp
+```
+
+### HRV Moderation by Activity: Young
+```{r}
+# ---- 1. Fit GAMM for HRV with cyclic spline by PA_TERTILE ----
+formula_hrv_pa_young <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = PA_TERTILE) +
+  PA_TERTILE + GENDER + BMI + HRV_person_mean
+
+model_hrv_pa_y <- bam(
+  formula_hrv_pa_young,
+  data = df_young,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_hrv_y <- predict_marginal_trajectory(
+  model_hrv_pa_y,
+  data = df_young,
+  by_var = "PA_TERTILE"
+)
+
+# ---- 3. Plot ----
+p_s6_hrv_pa <- ggplot(v_df_hrv_y, aes(x = MONTH_NUM, y = visregFit, color = PA_TERTILE, fill = PA_TERTILE)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "Activity Group", values = pa_colors) +
+  scale_fill_manual(name = "Activity Group", values = pa_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s6_hrv_pa
+
+# ---- 4. Bootstrap amplitude + pairwise ----
+boot_hrv_pa_young <- bootstrap_amplitude(df_young, formula_hrv_pa_young, by = "PA_TERTILE")
+
+bootstrap_summary_hrv_y <- boot_hrv_pa_young %>%
+  group_by(PA_TERTILE) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_hrv_y <- bootstrap_pairwise(boot_hrv_pa_young, "PA_TERTILE")
+```
+
+### RHR Moderation by BMI: Young
+```{r}
+# Count participants in each BMI category
+df_young_bmi %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(n_users = n_distinct(USER_ID), .groups = "drop")
+
+# ---- 1. Fit GAMM with cyclic spline by BMI_CATEGORY ----
+formula_rhr_bmi_young <- RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+  BMI_CATEGORY + GENDER + SHRZS_b + SHRZS_w + RHR_person_mean
+
+model_rhr_bmi_young <- bam(
+  formula_rhr_bmi_young,
+  data = df_young_bmi,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_bmi_young <- predict_marginal_trajectory(
+  model_rhr_bmi_young,
+  data = df_young_bmi,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 3. Plot ----
+p_s6_rhr_bmi <- ggplot(v_df_bmi_young, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_s6_rhr_bmi
+
+# ---- 4. Bootstrap amplitude + pairwise (formula matches primary model) ----
+boot_rhr_bmi_young <- bootstrap_amplitude(df_young_bmi, formula_rhr_bmi_young, by = "BMI_CATEGORY")
+
+bootstrap_summary_bmi_young <- boot_rhr_bmi_young %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_bmi_young <- bootstrap_pairwise(boot_rhr_bmi_young, "BMI_CATEGORY")
+```
+
+### RHR Moderation by BMI: Young (Plotting Only; No Overweight)
+```{r}
+df_young_bmi_no <- df_young_bmi %>%
+  filter(BMI_CATEGORY %in% c("Normal", "Obese")) %>%
+  mutate(BMI_CATEGORY = factor(BMI_CATEGORY, levels = c("Normal", "Obese")))
+
+# Fit GAMM with cyclic spline by BMI_CATEGORY
+model_rhr_bmi_young_no <- bam(
+  RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+    BMI_CATEGORY + GENDER + SHRZS_b + SHRZS_w + BMI + RHR_person_mean,
+  data = df_young_bmi_no,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# Marginal trajectory (averages over GENDER; lpmatrix-based SE)
+v_df_bmi_young_no <- predict_marginal_trajectory(
+  model_rhr_bmi_young_no,
+  data = df_young_bmi_no,
+  by_var = "BMI_CATEGORY"
+)
+
+bmi_colors_no <- c("Normal" = "#4daf4a", "Obese" = "#e41a1c")
+
+# Plot
+ggplot(v_df_bmi_young_no, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors_no) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors_no) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+```
+
+### HRV Moderation by BMI: Young
+```{r}
+# ---- 1. Fit GAMM with cyclic spline by BMI_CATEGORY ----
+formula_hrv_bmi_young <- HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+  BMI_CATEGORY + GENDER + SHRZS_b + SHRZS_w + HRV_person_mean
+
+model_hrv_bmi_young <- bam(
+  formula_hrv_bmi_young,
+  data = df_young_bmi,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 2. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_bmi_hrv_young <- predict_marginal_trajectory(
+  model_hrv_bmi_young,
+  data = df_young_bmi,
+  by_var = "BMI_CATEGORY"
+)
+
+# ---- 3. Plot ----
+p_s6_hrv_bmi <- ggplot(v_df_bmi_hrv_young, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_s6_hrv_bmi
+
+# ---- 4. Bootstrap amplitude + pairwise (formula matches primary model) ----
+boot_hrv_bmi_young <- bootstrap_amplitude(df_young_bmi, formula_hrv_bmi_young, by = "BMI_CATEGORY")
+
+bootstrap_summary_bmi_hrv_young <- boot_hrv_bmi_young %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    mean_amp = mean(amplitude, na.rm = TRUE),
+    ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+    ci_high = quantile(amplitude, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+boot_pvals_bmi_hrv_young <- bootstrap_pairwise(boot_hrv_bmi_young, "BMI_CATEGORY")
+```
+
+### HRV Moderation by BMI: Young (Plotting Only; No Overweight)
+```{r}
+# ---- Fit GAMM with cyclic spline by BMI_CATEGORY (reuses df_young_bmi_no from RHR section) ----
+model_hrv_bmi_young_no <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12, by = BMI_CATEGORY) +
+    BMI_CATEGORY + GENDER + BMI + HRV_person_mean,
+  data = df_young_bmi_no,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- 3. Marginal trajectory (averages over GENDER; lpmatrix-based SE) ----
+v_df_hrv_bmi_young_no <- predict_marginal_trajectory(
+  model_hrv_bmi_young_no,
+  data = df_young_bmi_no,
+  by_var = "BMI_CATEGORY"
+)
+
+bmi_colors_no <- c("Normal" = "#4daf4a", "Obese" = "#e41a1c")
+
+# ---- 4. Plot ----
+ggplot(v_df_hrv_bmi_young_no, aes(x = MONTH_NUM, y = visregFit, color = BMI_CATEGORY, fill = BMI_CATEGORY)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(name = "BMI Group", values = bmi_colors_no) +
+  scale_fill_manual(name = "BMI Group", values = bmi_colors_no) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+```
+
+### RHR Box-And-Whisker and LMM by BMI Category: Young
+```{r}
+# Subset young adults for Aug/Dec comparison
+df_young_bmi_aug_dec <- df_young_bmi %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(
+    MONTH_LABEL = factor(ifelse(MONTH_NUM == 8, "August", "December"), levels = c("August", "December")),
+    pattern = ifelse(MONTH_LABEL == "December", "stripe", "none")
+  )
+
+# Plot
+p_s6_rhr_box <- ggplot(df_young_bmi_aug_dec, aes(x = BMI_CATEGORY, y = RESTING_HEART_RATE)) +
+  geom_boxplot_pattern(
+    aes(
+      fill = BMI_CATEGORY,
+      pattern = MONTH_LABEL,
+      pattern_fill = BMI_CATEGORY
+    ),
+    position = position_dodge(width = 0.75),
+    color = "black",
+    pattern_density = 0.4,
+    pattern_spacing = 0.05,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    aes(group = interaction(MONTH_LABEL, BMI_CATEGORY)),
+    position = position_dodge(width = 0.75),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black"
+  ) +
+  scale_fill_manual(values = bmi_colors) +
+  scale_pattern_fill_manual(values = bmi_colors) +
+  scale_pattern_manual(
+    values = c("August" = "none", "December" = "stripe"),
+    name = "Month"
+  ) +
+  guides(
+    fill = "none",
+    pattern_fill = "none"
+  ) +
+  labs(
+    x = "BMI Category",
+    y = "Resting Heart Rate (bpm)"
+  ) +
+  theme_seasonality()
+p_s6_rhr_box
+
+# Linear Mixed Model
+model_young_rhr_bmi <- lmer(
+  RESTING_HEART_RATE ~ BMI_CATEGORY * MONTH_LABEL + GENDER + PA_TERTILE + RHR_person_mean + (1 | USER_ID),
+  data = df_young_bmi_aug_dec
+)
+
+# Model ANOVA
+anova(model_young_rhr_bmi)
+
+# BMI category differences within each month
+emmeans(model_young_rhr_bmi, pairwise ~ BMI_CATEGORY | MONTH_LABEL, adjust = "holm")
+
+# Month differences within each BMI category
+emmeans(model_young_rhr_bmi, pairwise ~ MONTH_LABEL | BMI_CATEGORY, adjust = "holm")
+```
+
+### HRV Box-And-Whisker and LMM by BMI Category: Young
+```{r}
+# Plot
+p_s6_hrv_box <- ggplot(df_young_bmi_aug_dec, aes(x = BMI_CATEGORY, y = HRV)) +
+  geom_boxplot_pattern(
+    aes(
+      fill = BMI_CATEGORY,
+      pattern = MONTH_LABEL,
+      pattern_fill = BMI_CATEGORY
+    ),
+    position = position_dodge(width = 0.75),
+    color = "black",
+    pattern_density = 0.4,
+    pattern_spacing = 0.05,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    aes(group = interaction(MONTH_LABEL, BMI_CATEGORY)),
+    position = position_dodge(width = 0.75),
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black"
+  ) +
+  scale_fill_manual(values = bmi_colors) +
+  scale_pattern_fill_manual(values = bmi_colors) +
+  scale_pattern_manual(
+    values = c("August" = "none", "December" = "stripe"),
+    name = "Month"
+  ) +
+  guides(
+    fill = "none",
+    pattern_fill = "none"
+  ) +
+  labs(
+    x = "BMI Category",
+    y = "HRV (ms)"
+  ) +
+  coord_cartesian(ylim = c(0, 150)) +
+  theme_seasonality()
+p_s6_hrv_box
+
+# Linear Mixed Model for HRV (same structure as RHR model)
+model_young_hrv_bmi <- lmer(
+  HRV ~ BMI_CATEGORY * MONTH_LABEL + GENDER + PA_TERTILE + HRV_person_mean + (1 | USER_ID),
+  data = df_young_bmi_aug_dec
+)
+
+# Type III ANOVA for fixed effects
+anova(model_young_hrv_bmi)
+
+emmeans(model_young_hrv_bmi, pairwise ~ BMI_CATEGORY | MONTH_LABEL, adjust = "holm")
+emmeans(model_young_hrv_bmi, pairwise ~ MONTH_LABEL | BMI_CATEGORY, adjust = "holm")
+```
+
+### Means+/-SD in BMI categories: Young
+```{r}
+df_young_bmi %>%
+  group_by(BMI_CATEGORY) %>%
+  summarise(
+    n_users = n_distinct(USER_ID),
+    mean_BMI = mean(BMI, na.rm = TRUE),
+    sd_BMI = sd(BMI, na.rm = TRUE),
+    mean_AGE_2023 = mean(AGE_2023, na.rm = TRUE),
+    sd_AGE_2023 = sd(AGE_2023, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+### Monthly summary of physical activity and sleep
+```{r}
+df_behavior_monthly <- df_month %>%
+  group_by(MONTH_NUM) %>%
+  summarise(
+    Sleep = mean(MINUTES_OF_SLEEP, na.rm = TRUE),
+    SHRZS = mean(SHRZS, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-MONTH_NUM, names_to = "Behavior", values_to = "Value")
+
+ggplot(df_behavior_monthly, aes(x = MONTH_NUM, y = Value)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  facet_wrap(~ Behavior, scales = "free_y", ncol = 1,
+             labeller = as_labeller(c(
+               Sleep = "Sleep Duration (min/night)",
+               SHRZS = "Physical Activity (SHRZS)"
+             ))) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  theme_seasonality(legend = FALSE) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+### Behavioral Seasonal Trajectories (Figures 3a–c)
+```{r}
+# 1. Fit cyclic GAMs
+model_sleep <- gam(MINUTES_OF_SLEEP ~ s(MONTH_NUM, bs = "cc", k = 12),
+                   data = df_month, method = "REML", knots = MONTH_KNOTS)
+
+model_activity <- gam(SHRZS ~ s(MONTH_NUM, bs = "cc", k = 12),
+                      data = df_month, method = "REML", knots = MONTH_KNOTS)
+
+# 2. Extract smooth fits with visreg
+vis_sleep <- visreg(model_sleep, xvar = "MONTH_NUM", plot = FALSE)
+vis_activity <- visreg(model_activity, xvar = "MONTH_NUM", plot = FALSE)
+
+# 3. Build tidy data frames for plotting
+df_sleep <- vis_sleep$fit %>%
+  mutate(Behavior = "Sleep Duration (min/night)")
+
+df_activity <- vis_activity$fit %>%
+  mutate(Behavior = "Physical Activity (SHRZS)")
+
+# 4. Define custom colors
+behavior_colors <- c(
+  "Sleep Duration (min/night)" = "#fc8d62",     # Orange
+  "Physical Activity (SHRZS)" = "#1f78b4"       # Blue
+)
+
+# 5. Plot each behavior separately (Figure 3a-b)
+
+# --- Sleep (Figure 3b) ---
+p_fig3b <- ggplot(df_sleep, aes(x = MONTH_NUM, y = visregFit)) +
+  geom_line(color = behavior_colors["Sleep Duration (min/night)"], linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr),
+              fill = behavior_colors["Sleep Duration (min/night)"], alpha = 0.3) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  ylab("Sleep Duration (min/night)") +
+  theme_seasonality(legend = FALSE)
+
+# --- Activity (Figure 3a) ---
+p_fig3a <- ggplot(df_activity, aes(x = MONTH_NUM, y = visregFit)) +
+  geom_line(color = behavior_colors["Physical Activity (SHRZS)"], linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr),
+              fill = behavior_colors["Physical Activity (SHRZS)"], alpha = 0.3) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  ylab("Physical Activity (SHRZS)") +
+  theme_seasonality(legend = FALSE)
+
+p_fig3a
+p_fig3b
+
+get_peak_nadir <- function(df, behavior_label) {
+  df <- df %>% mutate(Behavior = behavior_label)
+
+  peak <- df[which.max(df$visregFit), ]
+  nadir <- df[which.min(df$visregFit), ]
+
+  bind_rows(
+    peak = peak,
+    nadir = nadir,
+    .id = "Extreme"
+  )
+}
+
+extremes_sleep <- get_peak_nadir(df_sleep, "Sleep Duration (min/night)")
+extremes_activity <- get_peak_nadir(df_activity, "Physical Activity (SHRZS)")
+
+all_extremes <- bind_rows(
+  extremes_sleep,
+  extremes_activity
+)
+
+# Add readable month name
+all_extremes <- all_extremes %>%
+  mutate(Month = month.abb[MONTH_NUM]) %>%
+  select(Behavior, Extreme, MONTH_NUM, Month, visregFit)
+```
+
+```{r}
+# Add AGE_BUCKET as factor to ensure consistent ordering
+df_month <- df_month %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+# 1. Fit cyclic models by AGE_BUCKET
+model_sleep <- gam(
+  MINUTES_OF_SLEEP ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET,
+  data = df_month, method = "REML", knots = MONTH_KNOTS
+)
+
+model_activity <- gam(
+  SHRZS ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET,
+  data = df_month, method = "REML", knots = MONTH_KNOTS
+)
+
+vis_sleep <- visreg(model_sleep, xvar = "MONTH_NUM", by = "AGE_BUCKET",
+                    overlay = FALSE, plot = FALSE)
+
+vis_activity <- visreg(model_activity, xvar = "MONTH_NUM", by = "AGE_BUCKET",
+                       overlay = FALSE, plot = FALSE)
+
+df_sleep_age <- vis_sleep$fit %>%
+  mutate(Behavior = "Sleep Duration (min/night)")
+
+df_activity_age <- vis_activity$fit %>%
+  mutate(Behavior = "Physical Activity (SHRZS)")
+
+age_linetypes <- c(
+  "Young" = "solid",
+  "Middle" = "dashed",
+  "Old" = "dotted"
+)
+
+plot_behavior <- function(df_behavior, color) {
+  ggplot(df_behavior, aes(x = MONTH_NUM, y = visregFit,
+                          linetype = AGE_BUCKET)) +
+    geom_line(color = color, linewidth = 1.2) +
+    geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr),
+                fill = color, alpha = 0.15, color = NA) +
+    scale_linetype_manual(values = age_linetypes) +
+    scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+    labs(x = "Month",
+         y = unique(df_behavior$Behavior)) +
+    theme_seasonality(legend = FALSE)
+}
+
+# Figure S4: age-stratified behavioral seasonal curves
+p_s4b <- plot_behavior(df_sleep_age,
+                       behavior_colors["Sleep Duration (min/night)"])
+
+p_s4a <- plot_behavior(df_activity_age,
+                       behavior_colors["Physical Activity (SHRZS)"])
+
+p_s4a
+p_s4b
+
+legend_df <- data.frame(
+  AGE_BUCKET = c("Young", "Middle", "Old"),
+  x = c(1, 4, 7),
+  xend = c(2.5, 5.5, 8.5),
+  y = 1,
+  Label = c("Young", "Middle", "Old")
+)
+
+age_bucket_legend_horizontal <- ggplot(legend_df) +
+  geom_segment(
+    aes(x = x, xend = xend, y = y, yend = y, linetype = AGE_BUCKET),
+    color = "black", linewidth = 1.2
+  ) +
+  geom_text(
+    aes(x = xend + 0.3, y = y, label = Label),
+    hjust = 0, vjust = 0.5, fontface = "bold", size = 5
+  ) +
+  scale_linetype_manual(values = age_linetypes) +
+  coord_cartesian(xlim = c(0.5, 10), ylim = c(0.5, 1.5), clip = "off") +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+age_bucket_legend_horizontal
+```
+
+### Assemble Multi-Panel Figures
+```{r, fig.width=14, fig.height=12}
+# Assembles Figures 1-4 from component plots created above and writes PDF+PNG to the Main Figures directory.
+fig_dir <- "/Users/gregory.grosicki/Desktop/Seasonality/Main Figures"
+sup_dir <- "/Users/gregory.grosicki/Desktop/Seasonality/Supplementary Figures"
+
+# ---- Figure 1: RHR and HRV by Age Group (2x2) ----
+fig1 <- ((p_fig1a + p_fig1b) / (p_fig1c + p_fig1d)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig1
+ggsave(file.path(fig_dir, "Figure_1.pdf"), fig1, width = 14, height = 10, dpi = 300)
+ggsave(file.path(fig_dir, "Figure_1.png"), fig1, width = 14, height = 10, dpi = 300)
+
+# ---- Figure 2: RHR and HRV by Sex (2x2) ----
+fig2 <- ((p_fig2a + p_fig2b) / (p_fig2c + p_fig2d)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig2
+ggsave(file.path(fig_dir, "Figure_2.pdf"), fig2, width = 14, height = 10, dpi = 300)
+ggsave(file.path(fig_dir, "Figure_2.png"), fig2, width = 14, height = 10, dpi = 300)
+
+# ---- Figure 3: Behavioral Attenuation (3x3) ----
+fig3_theme <- theme(axis.text = element_text(size = 12, face = "bold"),
+                    axis.title = element_text(size = 14, face = "bold"))
+
+fig3 <- ((p_fig3a + fig3_theme) + (p_fig3b + fig3_theme)) /
+        ((p_fig3d + fig3_theme) + (p_fig3e + fig3_theme)) /
+        ((p_fig3g + fig3_theme) + (p_fig3h + fig3_theme)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 18, face = "bold"))
+fig3
+ggsave(file.path(fig_dir, "Figure_3.pdf"), fig3, width = 16, height = 14, dpi = 300)
+ggsave(file.path(fig_dir, "Figure_3.png"), fig3, width = 16, height = 14, dpi = 300)
+
+# ---- Figure 4: PA Level and BMI Moderation (2x2) ----
+fig4 <- ((p_fig4a + p_fig4b) / (p_fig4c + p_fig4d)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig4
+ggsave(file.path(fig_dir, "Figure_4.pdf"), fig4, width = 14, height = 10, dpi = 300)
+ggsave(file.path(fig_dir, "Figure_4.png"), fig4, width = 14, height = 10, dpi = 300)
+```
+
+### Supplementary Figure Assembly (Figures S1–S9)
+```{r, fig.width=14, fig.height=12}
+# ---- Figure S1: Overall RHR and HRV (1x2) ----
+fig_s1 <- (p_s1a + p_s1b) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s1
+ggsave(file.path(sup_dir, "Figure_S1.pdf"), fig_s1, width = 14, height = 5, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S1.png"), fig_s1, width = 14, height = 5, dpi = 300)
+
+# ---- Figure S2: RHR and HRV by Age – GAMM + Box-Whisker (2x2) ----
+fig_s2 <- ((p_s2a + p_s2b) / (p_s2c + p_s2d)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s2
+ggsave(file.path(sup_dir, "Figure_S2.pdf"), fig_s2, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S2.png"), fig_s2, width = 14, height = 10, dpi = 300)
+
+# ---- Figure S3: RHR and HRV by Sex – GAMM + Box-Whisker (2x2) ----
+fig_s3 <- ((p_s3a + p_s3b) / (p_s3c + p_s3d)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s3
+ggsave(file.path(sup_dir, "Figure_S3.pdf"), fig_s3, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S3.png"), fig_s3, width = 14, height = 10, dpi = 300)
+
+# ---- Figure S4: Behavioral Patterns by Age Group (1x2) ----
+fig_s4 <- (p_s4a + p_s4b + plot_layout(ncol = 2)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s4
+ggsave(file.path(sup_dir, "Figure_S4.pdf"), fig_s4, width = 12, height = 5, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S4.png"), fig_s4, width = 12, height = 5, dpi = 300)
+
+# NOTE: After integrating photoperiod into the behavioral-mediation narrative,
+# photoperiod (previously S9) becomes the new Figure S5 (appears first in text),
+# age-stratified all-adjusted becomes the new Figure S6, and the Aim-3 age-stratified
+# moderation figures are S7/S8/S9. Internal R object names (fig_s5, fig_s6, fig_s7,
+# fig_s8, fig_s9) reflect original creation order; saved filenames reflect final
+# numbering.
+
+# ---- Figure S5 (new): RHR and HRV amplitude vs annual daylight amplitude (1x2) ----
+fig_s9 <- (p_s9a + p_s9b) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s9
+ggsave(file.path(sup_dir, "Figure_S5.pdf"), fig_s9, width = 14, height = 5, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S5.png"), fig_s9, width = 14, height = 5, dpi = 300)
+
+# ---- Figure S6 (new): Adjusted RHR and HRV by Age (1x2) ----
+fig_s5 <- (p_s5a + p_s5b) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s5
+ggsave(file.path(sup_dir, "Figure_S6.pdf"), fig_s5, width = 14, height = 5, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S6.png"), fig_s5, width = 14, height = 5, dpi = 300)
+
+# ---- Figure S7 (new): Young Adults – PA and BMI (2x2) ----
+fig_s6 <- ((p_s6_rhr_pa + p_s6_hrv_pa) / (p_s6_rhr_bmi + p_s6_hrv_bmi)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s6
+ggsave(file.path(sup_dir, "Figure_S7.pdf"), fig_s6, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S7.png"), fig_s6, width = 14, height = 10, dpi = 300)
+
+# ---- Figure S8 (new): Middle-Aged Adults – PA and BMI (2x2) ----
+fig_s7 <- ((p_s7_rhr_pa + p_s7_hrv_pa) / (p_s7_rhr_bmi + p_s7_hrv_bmi)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s7
+ggsave(file.path(sup_dir, "Figure_S8.pdf"), fig_s7, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S8.png"), fig_s7, width = 14, height = 10, dpi = 300)
+
+# ---- Figure S9 (new): Older Adults – PA and BMI (2x2) ----
+fig_s8 <- ((p_s8_rhr_pa + p_s8_hrv_pa) / (p_s8_rhr_bmi + p_s8_hrv_bmi)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s8
+ggsave(file.path(sup_dir, "Figure_S9.pdf"), fig_s8, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S9.png"), fig_s8, width = 14, height = 10, dpi = 300)
+```
+
+### Export Results as CSVs
+```{r}
+# Exports bootstrap amplitude summaries, pairwise p-values, attenuation estimates, and Aug/Dec contrasts for every aim to the Results CSVs directory. Each numbered block below corresponds to a figure in the paper.
+csv_dir <- "/Users/gregory.grosicki/Desktop/Seasonality/Results CSVs"
+dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ---- 1. Overall amplitude (Figure S1) ----
+overall_amp <- tibble(
+  Outcome = c("RHR", "HRV"),
+  mean_amp = c(
+    mean(boot_rhr_overall$amplitude, na.rm = TRUE),
+    mean(boot_hrv_overall$amplitude, na.rm = TRUE)
+  ),
+  ci_low = c(
+    quantile(boot_rhr_overall$amplitude, 0.025, na.rm = TRUE),
+    quantile(boot_hrv_overall$amplitude, 0.025, na.rm = TRUE)
+  ),
+  ci_high = c(
+    quantile(boot_rhr_overall$amplitude, 0.975, na.rm = TRUE),
+    quantile(boot_hrv_overall$amplitude, 0.975, na.rm = TRUE)
+  )
+)
+write.csv(overall_amp, file.path(csv_dir, "overall_amplitude.csv"), row.names = FALSE)
+
+# ---- 2. Amplitude by Age – GAM bootstrap (Figure 1A/C) ----
+boot_age_rhr <- boot_rhr_age %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE),
+            ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+            ci_high = quantile(amplitude, 0.975, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Outcome = "RHR")
+boot_age_hrv <- boot_hrv_age %>%
+  group_by(AGE_BUCKET) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE),
+            ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+            ci_high = quantile(amplitude, 0.975, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Outcome = "HRV")
+write.csv(bind_rows(boot_age_rhr, boot_age_hrv), file.path(csv_dir, "amplitude_by_age_GAM.csv"), row.names = FALSE)
+
+# Pairwise p-values
+write.csv(
+  bind_rows(boot_pvals %>% mutate(Outcome = "RHR"), boot_pvals_hrv_age %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_age_GAM_pvals.csv"), row.names = FALSE
+)
+
+# ---- 3. Amplitude by Age – GAMM point estimates (Figure S2A/C) ----
+write.csv(
+  bind_rows(amplitude_gamm %>% mutate(Outcome = "RHR"), amplitude_gamm_hrv %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_age_GAMM.csv"), row.names = FALSE
+)
+
+# ---- 4. GAMM pairwise contrasts by Age at Aug/Dec (Figure S2B/D) ----
+write.csv(contrasts_all %>% mutate(Outcome = "RHR"), file.path(csv_dir, "GAMM_age_contrasts_RHR.csv"), row.names = FALSE)
+# HRV contrasts (same structure computed in HRV GAMM section)
+if (exists("contrasts_all_hrv")) {
+  write.csv(contrasts_all_hrv %>% mutate(Outcome = "HRV"), file.path(csv_dir, "GAMM_age_contrasts_HRV.csv"), row.names = FALSE)
+}
+
+# ---- 5. Individual-level amplitude by Age (Figure 1B/D) ----
+write.csv(amplitude_summary %>% mutate(Outcome = "RHR"), file.path(csv_dir, "individual_amplitude_by_age_RHR.csv"), row.names = FALSE)
+if (exists("amplitude_summary_hrv")) {
+  write.csv(amplitude_summary_hrv %>% mutate(Outcome = "HRV"), file.path(csv_dir, "individual_amplitude_by_age_HRV.csv"), row.names = FALSE)
+}
+
+# ---- 6. Amplitude by Sex – GAM bootstrap (Figure 2A/C) ----
+boot_sex_rhr <- boot_rhr_sex %>%
+  group_by(GENDER) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE),
+            ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+            ci_high = quantile(amplitude, 0.975, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Outcome = "RHR")
+boot_sex_hrv <- boot_hrv_sex %>%
+  group_by(GENDER) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE),
+            ci_low = quantile(amplitude, 0.025, na.rm = TRUE),
+            ci_high = quantile(amplitude, 0.975, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Outcome = "HRV")
+write.csv(bind_rows(boot_sex_rhr, boot_sex_hrv), file.path(csv_dir, "amplitude_by_sex_GAM.csv"), row.names = FALSE)
+
+# Pairwise p-values
+write.csv(
+  bind_rows(boot_pvals_sex_rhr %>% mutate(Outcome = "RHR"), boot_pvals_sex_hrv %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_sex_GAM_pvals.csv"), row.names = FALSE
+)
+
+# ---- 7. Amplitude by Sex – GAMM point estimates (Figure S3A/C) ----
+write.csv(
+  bind_rows(amplitude_gamm_gender %>% mutate(Outcome = "RHR"), amplitude_gamm_gender_hrv %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_sex_GAMM.csv"), row.names = FALSE
+)
+
+# ---- 8. GAMM pairwise contrasts by Sex at Aug/Dec (Figure S3B/D) ----
+write.csv(gender_contrasts %>% mutate(Outcome = "RHR"), file.path(csv_dir, "GAMM_sex_contrasts_RHR.csv"), row.names = FALSE)
+write.csv(gender_contrasts_hrv %>% mutate(Outcome = "HRV"), file.path(csv_dir, "GAMM_sex_contrasts_HRV.csv"), row.names = FALSE)
+
+# ---- 9. Attenuation results (Figure 3D-I) ----
+extract_attenuation <- function(att, label) {
+  amp_diff <- att$amp_base - att$amp_adj
+  tibble(
+    Covariate = label,
+    mean_base = mean(att$amp_base),
+    ci_base_low = quantile(att$amp_base, 0.025),
+    ci_base_high = quantile(att$amp_base, 0.975),
+    mean_adj = mean(att$amp_adj),
+    ci_adj_low = quantile(att$amp_adj, 0.025),
+    ci_adj_high = quantile(att$amp_adj, 0.975),
+    mean_diff = mean(att$amp_base) - mean(att$amp_adj),
+    ci_diff_low = quantile(amp_diff, 0.025),
+    ci_diff_high = quantile(amp_diff, 0.975),
+    pct_attenuation = (mean(att$amp_base) - mean(att$amp_adj)) / mean(att$amp_base) * 100,
+    n_valid = att$n_valid
+  )
+}
+
+attenuation_results <- bind_rows(
+  extract_attenuation(att_rhr_pa, "PA") %>% mutate(Outcome = "RHR"),
+  extract_attenuation(att_hrv_pa, "PA") %>% mutate(Outcome = "HRV"),
+  extract_attenuation(att_rhr_sleep, "Sleep") %>% mutate(Outcome = "RHR"),
+  extract_attenuation(att_hrv_sleep, "Sleep") %>% mutate(Outcome = "HRV")
+)
+write.csv(attenuation_results, file.path(csv_dir, "attenuation_results.csv"), row.names = FALSE)
+
+# ---- 10. Adjusted amplitude by Age (Figure S5) ----
+write.csv(
+  bind_rows(bootstrap_summary_rhr %>% mutate(Outcome = "RHR"), bootstrap_summary_hrv_adj %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "adjusted_amplitude_by_age.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_rhr %>% mutate(Outcome = "RHR"), boot_pvals_hrv_adj %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "adjusted_amplitude_by_age_pvals.csv"), row.names = FALSE
+)
+
+# ---- 11. PA moderation – All ages (Figure 4A/B) ----
+write.csv(
+  bind_rows(bootstrap_summary_pa_all %>% mutate(Outcome = "RHR"), bootstrap_summary_hrv_pa_all %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_PA_all.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_pa_all %>% mutate(Outcome = "RHR"), boot_pvals_hrv_pa_all %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_PA_all_pvals.csv"), row.names = FALSE
+)
+
+# ---- 12. BMI moderation – All ages (Figure 4C/D) ----
+write.csv(
+  bind_rows(bootstrap_summary_bmi_all %>% mutate(Outcome = "RHR"), bootstrap_summary_hrv_bmi_all %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_BMI_all.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_bmi_all %>% mutate(Outcome = "RHR"), boot_pvals_hrv_bmi_all %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_BMI_all_pvals.csv"), row.names = FALSE
+)
+
+# ---- 13. Age-stratified PA moderation (Figures S6-S8) ----
+# Young
+write.csv(
+  bind_rows(bootstrap_summary_pa_y %>% mutate(Outcome = "RHR"), bootstrap_summary_hrv_y %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_PA_young.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_pa_y %>% mutate(Outcome = "RHR"), boot_pvals_hrv_y %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_PA_young_pvals.csv"), row.names = FALSE
+)
+
+# Middle
+write.csv(
+  bind_rows(bootstrap_summary_pa_mid %>% mutate(Outcome = "RHR"),
+            bootstrap_summary_hrv_pa_mid %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_PA_middle.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_pa_mid %>% mutate(Outcome = "RHR"),
+            boot_pvals_hrv_pa_mid %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_PA_middle_pvals.csv"), row.names = FALSE
+)
+
+# Old
+write.csv(
+  bind_rows(bootstrap_summary_pa_old %>% mutate(Outcome = "RHR"),
+            bootstrap_summary_hrv_pa_old %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_PA_old.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_pa_old %>% mutate(Outcome = "RHR"),
+            boot_pvals_hrv_pa_old %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_PA_old_pvals.csv"), row.names = FALSE
+)
+
+# ---- 14. Age-stratified BMI moderation (Figures S6-S8) ----
+# Young
+write.csv(
+  bind_rows(bootstrap_summary_bmi_young %>% mutate(Outcome = "RHR"),
+            bootstrap_summary_bmi_hrv_young %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_BMI_young.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_bmi_young %>% mutate(Outcome = "RHR"),
+            boot_pvals_bmi_hrv_young %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_BMI_young_pvals.csv"), row.names = FALSE
+)
+
+# Middle
+write.csv(
+  bind_rows(bootstrap_summary_bmi_mid %>% mutate(Outcome = "RHR"),
+            bootstrap_summary_hrv_bmi_mid %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_BMI_middle.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_bmi_mid %>% mutate(Outcome = "RHR"),
+            boot_pvals_hrv_bmi_mid %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_BMI_middle_pvals.csv"), row.names = FALSE
+)
+
+# Old
+write.csv(
+  bind_rows(bootstrap_summary_bmi_old %>% mutate(Outcome = "RHR"),
+            bootstrap_summary_hrv_bmi_old %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_BMI_old.csv"), row.names = FALSE
+)
+write.csv(
+  bind_rows(boot_pvals_bmi_old %>% mutate(Outcome = "RHR"),
+            boot_pvals_hrv_bmi_old %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_BMI_old_pvals.csv"), row.names = FALSE
+)
+
+# ---- 15. Mixed model ANOVA and emmeans for Aug/Dec comparisons ----
+# Age × Month (RHR)
+emm_age_month_rhr <- as.data.frame(emmeans(model_aug_dec_rhr_age, pairwise ~ AGE_BUCKET | MONTH_LABEL, adjust = "holm")$contrasts)
+emm_month_age_rhr <- as.data.frame(emmeans(model_aug_dec_rhr_age, pairwise ~ MONTH_LABEL | AGE_BUCKET, adjust = "holm")$contrasts)
+write.csv(emm_age_month_rhr, file.path(csv_dir, "emmeans_age_within_month_RHR.csv"), row.names = FALSE)
+write.csv(emm_month_age_rhr, file.path(csv_dir, "emmeans_month_within_age_RHR.csv"), row.names = FALSE)
+
+# Age × Month (HRV)
+emm_age_month_hrv <- as.data.frame(emmeans(model_aug_dec_hrv_age, pairwise ~ AGE_BUCKET | MONTH_LABEL, adjust = "holm")$contrasts)
+emm_month_age_hrv <- as.data.frame(emmeans(model_aug_dec_hrv_age, pairwise ~ MONTH_LABEL | AGE_BUCKET, adjust = "holm")$contrasts)
+write.csv(emm_age_month_hrv, file.path(csv_dir, "emmeans_age_within_month_HRV.csv"), row.names = FALSE)
+write.csv(emm_month_age_hrv, file.path(csv_dir, "emmeans_month_within_age_HRV.csv"), row.names = FALSE)
+
+# Sex × Month (RHR)
+anova_sex_rhr <- as.data.frame(anova(model_aug_dec_rhr_gender))
+write.csv(anova_sex_rhr, file.path(csv_dir, "anova_sex_month_RHR.csv"), row.names = TRUE)
+
+# Sex × Month (HRV)
+anova_sex_hrv <- as.data.frame(anova(model_hrv_gender_interact))
+write.csv(anova_sex_hrv, file.path(csv_dir, "anova_sex_month_HRV.csv"), row.names = TRUE)
+
+# Individual-level amplitude Tukey (HRV)
+emm_hrv_age <- emmeans(model_amplitude_hrv, ~ AGE_BUCKET)
+tukey_hrv_age <- as.data.frame(pairs(emm_hrv_age, adjust = "tukey"))
+write.csv(tukey_hrv_age, file.path(csv_dir, "individual_amplitude_tukey_HRV.csv"), row.names = FALSE)
+
+# Individual-level amplitude by Sex (RHR)
+  tukey_sex_rhr <- as.data.frame(pairs(emmeans(model_amplitude_gender, ~ GENDER), adjust = "tukey"))                                                                               
+  write.csv(tukey_sex_rhr, file.path(csv_dir, "individual_amplitude_tukey_sex_RHR.csv"), row.names = FALSE)   
+  
+  tukey_sex_hrv <- as.data.frame(pairs(emmeans(model_amplitude_gender_hrv, ~ GENDER), adjust = "tukey"))
+  write.csv(tukey_sex_hrv, file.path(csv_dir, "individual_amplitude_tukey_sex_HRV.csv"), row.names = FALSE)
+
+# ---- 16. Geographic daylight-amplitude regression (Figure S9) ----
+write.csv(daylight_results, file.path(csv_dir, "amplitude_by_daylight.csv"), row.names = FALSE)
+
+cat("All results CSVs saved to:", csv_dir, "\n")
+```
+
+## Sensitivity: December–January average as winter reference (individual-level)
+
+```{r winter-avg-sensitivity}
+# Holiday-related behavior is concentrated in late December. To confirm the
+# winter peak is not December-specific, we recompute per-person seasonal
+# amplitude using the mean of December and January as the winter reference
+# (instead of December alone) and re-test age and sex group differences.
+# This is the individual-level (no-spline) analog of Fig 1B/D and Fig 2B/D,
+# computed on the same person-mean-centered scale (RHR_within / HRV_within),
+# so values are directly comparable to the December-only estimates.
+
+# ---- Winter = mean(December, January); Summer = August ----
+df_winteravg <- df_month %>%
+  filter(MONTH_NUM %in% c(1, 8, 12)) %>%
+  mutate(SEASON = if_else(MONTH_NUM == 8, "August", "Winter")) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_rhr        = mean(RHR_within, na.rm = TRUE),
+    mean_hrv        = mean(HRV_within, na.rm = TRUE),
+    AGE_BUCKET      = first(AGE_BUCKET),
+    AGE_2023        = first(AGE_2023),
+    BMI             = first(BMI),
+    GENDER          = first(GENDER),
+    RHR_person_mean = first(RHR_person_mean),
+    HRV_person_mean = first(HRV_person_mean),
+    .groups = "drop"
+  )
+
+# RHR amplitude = Winter - August (winter minus summer)
+df_amp_rhr_wa <- df_winteravg %>%
+  select(USER_ID, SEASON, mean_rhr, AGE_BUCKET, AGE_2023, BMI, GENDER, RHR_person_mean) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_rhr) %>%
+  mutate(amplitude = Winter - August)
+
+# HRV amplitude = August - Winter (summer minus winter)
+df_amp_hrv_wa <- df_winteravg %>%
+  select(USER_ID, SEASON, mean_hrv, AGE_BUCKET, AGE_2023, BMI, GENDER, HRV_person_mean) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_hrv) %>%
+  mutate(amplitude = August - Winter)
+
+# ---- Per-age summaries (compare against the December-only values) ----
+summarise_amp_wa <- function(d) {
+  d %>%
+    group_by(AGE_BUCKET) %>%
+    summarise(
+      mean_amplitude = mean(amplitude, na.rm = TRUE),
+      sd_amplitude   = sd(amplitude, na.rm = TRUE),
+      n              = n(),
+      mean_sd        = paste0(round(mean_amplitude, 2), " ± ", round(sd_amplitude, 2)),
+      .groups = "drop"
+    )
+}
+amp_age_rhr_wa <- summarise_amp_wa(df_amp_rhr_wa) %>% mutate(Outcome = "RHR", Winter_ref = "Dec-Jan avg")
+amp_age_hrv_wa <- summarise_amp_wa(df_amp_hrv_wa) %>% mutate(Outcome = "HRV", Winter_ref = "Dec-Jan avg")
+cat("\n--- Individual-level amplitude by age (Dec-Jan average winter reference) ---\n")
+print(amp_age_rhr_wa); print(amp_age_hrv_wa)
+
+# ---- Age group differences (mirrors Fig 1B/D adjustment set) ----
+model_amp_rhr_wa <- lm(amplitude ~ AGE_BUCKET + GENDER + BMI + RHR_person_mean, data = df_amp_rhr_wa)
+model_amp_hrv_wa <- lm(amplitude ~ AGE_BUCKET + GENDER + BMI + HRV_person_mean, data = df_amp_hrv_wa)
+tukey_age_rhr_wa <- as.data.frame(pairs(emmeans(model_amp_rhr_wa, ~ AGE_BUCKET), adjust = "tukey")) %>% mutate(Outcome = "RHR")
+tukey_age_hrv_wa <- as.data.frame(pairs(emmeans(model_amp_hrv_wa, ~ AGE_BUCKET), adjust = "tukey")) %>% mutate(Outcome = "HRV")
+cat("\n--- Age pairwise contrasts (Dec-Jan average winter reference) ---\n")
+print(tukey_age_rhr_wa); print(tukey_age_hrv_wa)
+
+# ---- Sex group differences (mirrors Fig 2B/D adjustment set) ----
+model_amp_rhr_sex_wa <- lm(amplitude ~ GENDER + splines::ns(AGE_2023, df = 3) + BMI + RHR_person_mean, data = df_amp_rhr_wa)
+model_amp_hrv_sex_wa <- lm(amplitude ~ GENDER + splines::ns(AGE_2023, df = 3) + BMI + HRV_person_mean, data = df_amp_hrv_wa)
+tukey_sex_rhr_wa <- as.data.frame(pairs(emmeans(model_amp_rhr_sex_wa, ~ GENDER), adjust = "tukey")) %>% mutate(Outcome = "RHR")
+tukey_sex_hrv_wa <- as.data.frame(pairs(emmeans(model_amp_hrv_sex_wa, ~ GENDER), adjust = "tukey")) %>% mutate(Outcome = "HRV")
+cat("\n--- Sex pairwise contrasts (Dec-Jan average winter reference) ---\n")
+print(tukey_sex_rhr_wa); print(tukey_sex_hrv_wa)
+
+# ---- Save ----
+write.csv(bind_rows(amp_age_rhr_wa, amp_age_hrv_wa),
+          file.path(csv_dir, "individual_amplitude_winteravg_by_age.csv"), row.names = FALSE)
+write.csv(bind_rows(tukey_age_rhr_wa, tukey_age_hrv_wa),
+          file.path(csv_dir, "individual_amplitude_winteravg_tukey_age.csv"), row.names = FALSE)
+write.csv(bind_rows(tukey_sex_rhr_wa, tukey_sex_hrv_wa),
+          file.path(csv_dir, "individual_amplitude_winteravg_tukey_sex.csv"), row.names = FALSE)
+cat("\nWinter-average sensitivity CSVs saved to:", csv_dir, "\n")
+```
