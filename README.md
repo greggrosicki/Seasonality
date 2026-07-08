@@ -19,7 +19,7 @@ and individual (age, sex, BMI, habitual physical activity) moderators of seasona
 
 The participant data are **not** included in this repository due to intellectual property
 considerations of WHOOP, Inc. Deidentified participant data and a data dictionary may be made
-available upon reasonable request to WHOOP (research@whoop.com), subject to a methodologically
+available upon reasonable request to WHOOP (science@whoop.com), subject to a methodologically
 sound proposal approved by WHOOP's research team and a signed data use agreement. The code is
 provided for transparency and reproducibility of the analytical methods.
 
