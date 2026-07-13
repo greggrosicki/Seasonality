@@ -2,7 +2,7 @@
 
 Analysis code for the manuscript:
 
-> **Age Moderates Seasonal Variation in Cardiac Autonomic Function: A Year-Long Wearable Study of 16,415 U.S. Adults.**
+> **Age Moderates Seasonal Variation in Resting Heart Rate and Heart Rate Variability: A Year-Long Wearable Study of 16,415 U.S. Adults.**
 
 This repository contains the analysis script used to characterize seasonal variation in
 resting heart rate (RHR) and heart rate variability (HRV) in a cohort of U.S. adults using
