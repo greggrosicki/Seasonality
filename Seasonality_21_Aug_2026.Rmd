@@ -48,8 +48,11 @@ MONTH_KNOTS <- list(MONTH_NUM = c(0.5, 12.5))
 ### Read in data
 ```{r}
 # Use cached RDS if available; otherwise read CSV and cache
-data_rds <- "/Users/gregory.grosicki/Desktop/Seasonality/Seasonality_npjDig/Seasonality_Pull_22_Apr_2026.rds"
-data_csv <- "/Users/gregory.grosicki/Desktop/Seasonality/Seasonality_npjDig/Seasonality_Pull_22_Apr_2026.csv"
+# Set BASE_DIR to the project root. All input and output paths derive from it.
+BASE_DIR <- "/Users/gregory.grosicki/Desktop/Seasonality"
+
+data_rds <- file.path(BASE_DIR, "Seasonality_npjDig/Seasonality_Pull_22_Apr_2026.rds")
+data_csv <- file.path(BASE_DIR, "Seasonality_npjDig/Seasonality_Pull_22_Apr_2026.csv")
 
 if (file.exists(data_rds)) {
   df <- readRDS(data_rds)
@@ -641,6 +644,9 @@ df_month <- df %>%
     HRV = mean(HRV, na.rm = TRUE),
     SHRZS = mean(SHRZS, na.rm = TRUE),
     MINUTES_OF_SLEEP = mean(MINUTES_OF_SLEEP, na.rm = TRUE),
+    RESPIRATORY_RATE = mean(RESPIRATORY_RATE, na.rm = TRUE),  # R1 (Reviewer 5.3)
+    SLEEP_CONSISTENCY = mean(SLEEP_CONSISTENCY, na.rm = TRUE),  # R1 (Reviewers 2.6, 6.4)
+    SLEEP_EFFICIENCY = mean(SLEEP_EFFICIENCY, na.rm = TRUE),    # R1 (Reviewers 2.6, 6.4)
 
     # Static user fields
     STRAP_GENERATION = first(na.omit(STRAP_GENERATION)),
@@ -660,10 +666,16 @@ df_month <- df_month %>%
     # Person-level mean (between-person)
     SHRZS_b = mean(SHRZS, na.rm = TRUE),
     MINUTES_OF_SLEEP_b = mean(MINUTES_OF_SLEEP, na.rm = TRUE),
+    RR_b = mean(RESPIRATORY_RATE, na.rm = TRUE),  # R1 (Reviewer 5.3)
+    SLEEP_CONSISTENCY_b = mean(SLEEP_CONSISTENCY, na.rm = TRUE),  # R1 (Reviewers 2.6, 6.4)
+    SLEEP_EFFICIENCY_b = mean(SLEEP_EFFICIENCY, na.rm = TRUE),
 
     # Person-mean centered (within-person)
     SHRZS_w = SHRZS - SHRZS_b,
-    MINUTES_OF_SLEEP_w = MINUTES_OF_SLEEP - MINUTES_OF_SLEEP_b
+    MINUTES_OF_SLEEP_w = MINUTES_OF_SLEEP - MINUTES_OF_SLEEP_b,
+    RR_w = RESPIRATORY_RATE - RR_b,
+    SLEEP_CONSISTENCY_w = SLEEP_CONSISTENCY - SLEEP_CONSISTENCY_b,
+    SLEEP_EFFICIENCY_w = SLEEP_EFFICIENCY - SLEEP_EFFICIENCY_b
   ) %>%
   ungroup()
 ```
@@ -1852,6 +1864,78 @@ p_fig2d <- ggplot(df_amplitude_gender_hrv, aes(x = GENDER, y = amplitude, fill =
 
 p_fig2d
 ```
+
+### Sensitivity: Sex Differences in Amplitude Within Age Groups (Table S2B)
+```{r}
+# R1 (Reviewer 5.1): test whether sex differences in individual-level seasonal
+# amplitude vary across age groups. Extends the Model-3 amplitude regressions
+# with a GENDER x AGE_BUCKET interaction; emmeans give adjusted within-stratum
+# sex contrasts. AGE_BUCKET replaces the continuous age spline here because the
+# stratified contrasts are the estimand of interest.
+age_lookup <- df_month %>% distinct(USER_ID, AGE_BUCKET)
+
+df_amp_sexage_rhr <- df_amplitude_gender %>%
+  left_join(age_lookup, by = "USER_ID") %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+df_amp_sexage_hrv <- df_amplitude_gender_hrv %>%
+  left_join(age_lookup, by = "USER_ID") %>%
+  mutate(AGE_BUCKET = factor(AGE_BUCKET, levels = c("Young", "Middle", "Old")))
+
+# ---- Interaction F-tests (sex x age group) ----
+model_sexage_rhr  <- lm(amplitude ~ GENDER * AGE_BUCKET + BMI + RHR_person_mean,
+                        data = df_amp_sexage_rhr)
+model_sexage_rhr0 <- lm(amplitude ~ GENDER + AGE_BUCKET + BMI + RHR_person_mean,
+                        data = df_amp_sexage_rhr)
+model_sexage_hrv  <- lm(amplitude ~ GENDER * AGE_BUCKET + BMI + HRV_person_mean,
+                        data = df_amp_sexage_hrv)
+model_sexage_hrv0 <- lm(amplitude ~ GENDER + AGE_BUCKET + BMI + HRV_person_mean,
+                        data = df_amp_sexage_hrv)
+
+print(anova(model_sexage_rhr0, model_sexage_rhr))
+print(anova(model_sexage_hrv0, model_sexage_hrv))
+
+# ---- Adjusted amplitude by sex within age stratum + contrasts ----
+emm_sexage_rhr <- emmeans(model_sexage_rhr, ~ GENDER | AGE_BUCKET)
+emm_sexage_hrv <- emmeans(model_sexage_hrv, ~ GENDER | AGE_BUCKET)
+
+print(summary(emm_sexage_rhr))
+print(as.data.frame(pairs(emm_sexage_rhr)))
+print(summary(emm_sexage_hrv))
+print(as.data.frame(pairs(emm_sexage_hrv)))
+
+# ---- Cell sizes (older women underrepresented: 1,415 vs 3,000) ----
+print(count(df_amp_sexage_rhr, AGE_BUCKET, GENDER))
+```
+
+### Sensitivity: Amplitude by Decade of Age (Table S1B)
+```{r}
+# R1 (Reviewer 4.2): individual-level seasonal amplitude stratified into
+# 10-year age bands, confirming the graded decline seen with three groups.
+# Reuses the Model-3 amplitude frames (df_amplitude_gender carries AGE_2023).
+decade_cut <- function(a) cut(a, breaks = c(17, 29, 39, 49, 59, 69, 79),
+                              labels = c("18-29","30-39","40-49","50-59","60-69","70-79"))
+
+df_amp_decade_rhr <- df_amplitude_gender %>%
+  mutate(DECADE = decade_cut(AGE_2023)) %>% drop_na(DECADE, amplitude, BMI)
+df_amp_decade_hrv <- df_amplitude_gender_hrv %>%
+  mutate(DECADE = decade_cut(AGE_2023)) %>% drop_na(DECADE, amplitude, BMI)
+
+model_decade_rhr <- lm(amplitude ~ DECADE + GENDER + BMI + RHR_person_mean, data = df_amp_decade_rhr)
+model_decade_hrv <- lm(amplitude ~ DECADE + GENDER + BMI + HRV_person_mean, data = df_amp_decade_hrv)
+
+emm_decade_rhr <- emmeans(model_decade_rhr, ~ DECADE)
+emm_decade_hrv <- emmeans(model_decade_hrv, ~ DECADE)
+print(summary(emm_decade_rhr))
+print(summary(emm_decade_hrv))
+
+# Linear trend across decade bands (orthogonal polynomial contrast)
+print(as.data.frame(contrast(emm_decade_rhr, "poly")) %>% dplyr::filter(contrast == "linear"))
+print(as.data.frame(contrast(emm_decade_hrv, "poly")) %>% dplyr::filter(contrast == "linear"))
+
+print(count(df_amp_decade_rhr, DECADE))
+```
+
 ### Model 4 - Box and Whisker of Raw HRV Values in Peak and Trough Months by Sex
 ```{r}
 # ---- Filter and prepare data ----
@@ -2184,6 +2268,160 @@ att_hrv_sleep <- bootstrap_attenuation(
   formula_adj = HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + MINUTES_OF_SLEEP_b + MINUTES_OF_SLEEP_w
 )
 att_summary_hrv_sleep <- summarize_attenuation(att_hrv_sleep)
+```
+
+## Sleep Consistency (R1, Reviewers 2.6 & 6.4)
+### RHR
+```{r}
+# Sleep consistency (WHOOP sleep-regularity metric, 0-100%) captures the sleep
+# timing/regularity dimension raised by Reviewers 2 and 6. Mirrors the sleep-
+# duration attenuation analysis; overlay panels join Figure 3 as panels F and I.
+
+# Adjusted model (with sleep consistency)
+model_rhr_adj_cons <- bam(
+  RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) +
+    s(AGE_2023) + GENDER + BMI + RHR_person_mean +
+    SLEEP_CONSISTENCY_b + SLEEP_CONSISTENCY_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- Extract smooth fits ----
+v_base_df <- predict_marginal_trajectory(model_rhr_baseline, data = df_month) %>% mutate(Model = "Baseline")
+v_adj_df  <- predict_marginal_trajectory(model_rhr_adj_cons, data = df_month) %>% mutate(Model = "Adjusted")
+
+plot_df <- bind_rows(v_base_df, v_adj_df)
+
+# ---- Overlay plot (Figure 3f) ----
+p_fig3f <- ggplot(plot_df, aes(x = MONTH_NUM, y = visregFit, color = Model, fill = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(values = c("Baseline" = "black", "Adjusted" = "#33a02c")) +
+  scale_fill_manual(values = c("Baseline" = "black", "Adjusted" = "#33a02c")) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "RHR Offset (bpm)") +
+  theme_seasonality()
+p_fig3f
+
+# ---- Bootstrap attenuation ----
+att_rhr_cons <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_rhr_baseline,
+  formula_adj = RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + RHR_person_mean + SLEEP_CONSISTENCY_b + SLEEP_CONSISTENCY_w
+)
+att_summary_rhr_cons <- summarize_attenuation(att_rhr_cons)
+```
+### HRV
+```{r}
+# Adjusted model (with sleep consistency)
+model_hrv_adj_cons <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + SLEEP_CONSISTENCY_b + SLEEP_CONSISTENCY_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+
+# ---- Extract smooth fits ----
+v_base_df_hrv <- predict_marginal_trajectory(model_hrv_baseline, data = df_month) %>% mutate(Model = "Baseline")
+v_adj_df_hrv  <- predict_marginal_trajectory(model_hrv_adj_cons, data = df_month) %>% mutate(Model = "Adjusted")
+
+plot_df_hrv <- bind_rows(v_base_df_hrv, v_adj_df_hrv)
+
+# ---- Overlay plot (Figure 3i) ----
+p_fig3i <- ggplot(plot_df_hrv, aes(x = MONTH_NUM, y = visregFit, color = Model, fill = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr), alpha = 0.3, color = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(values = c("Baseline" = "black", "Adjusted" = "#33a02c")) +
+  scale_fill_manual(values = c("Baseline" = "black", "Adjusted" = "#33a02c")) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  scale_y_continuous(name = "HRV Offset (ms)") +
+  theme_seasonality()
+p_fig3i
+
+# ---- Bootstrap attenuation ----
+att_hrv_cons <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_hrv_baseline,
+  formula_adj = HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + SLEEP_CONSISTENCY_b + SLEEP_CONSISTENCY_w
+)
+att_summary_hrv_cons <- summarize_attenuation(att_hrv_cons)
+```
+
+## Sleep Efficiency (R1, Reviewers 2.6 & 6.4; Table S3 + text only)
+```{r}
+# Sleep efficiency summarizes sleep fragmentation: nocturnal disturbances are a
+# primary determinant of efficiency (more wake episodes -> lower efficiency),
+# so efficiency serves as the summary fragmentation metric and disturbances are
+# not additionally modeled. Reported in Table S3 and text; no figure panel.
+
+att_rhr_eff <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_rhr_baseline,
+  formula_adj = RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + RHR_person_mean + SLEEP_EFFICIENCY_b + SLEEP_EFFICIENCY_w
+)
+att_summary_rhr_eff <- summarize_attenuation(att_rhr_eff)
+
+att_hrv_eff <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_hrv_baseline,
+  formula_adj = HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + SLEEP_EFFICIENCY_b + SLEEP_EFFICIENCY_w
+)
+att_summary_hrv_eff <- summarize_attenuation(att_hrv_eff)
+```
+
+### Respiratory Rate (R1, Reviewer 5.3): Seasonality + Attenuation (Table S3)
+```{r}
+# Does nocturnal respiratory rate vary seasonally, and does adjusting for it
+# attenuate the seasonal amplitude in RHR/HRV? Mirrors the PA and sleep
+# attenuation analyses above; RR enters as between-person (RR_b) and
+# within-person (RR_w) components.
+
+# ---- 1. Seasonal trajectory of RR itself (within-person) ----
+model_rr_seasonal <- bam(
+  RR_w ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + RR_b,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+v_rr_df <- predict_marginal_trajectory(model_rr_seasonal, data = df_month)
+rr_amp <- max(v_rr_df$visregFit, na.rm = TRUE) - min(v_rr_df$visregFit, na.rm = TRUE)
+cat(sprintf("Within-person seasonal RR amplitude: %.3f breaths/min (peak month %.0f, trough month %.0f)\n",
+            rr_amp,
+            v_rr_df$MONTH_NUM[which.max(v_rr_df$visregFit)],
+            v_rr_df$MONTH_NUM[which.min(v_rr_df$visregFit)]))
+cat(sprintf("RR overall mean (SD): %.2f (%.2f) breaths/min\n",
+            mean(df_month$RESPIRATORY_RATE, na.rm = TRUE),
+            sd(df_month$RESPIRATORY_RATE, na.rm = TRUE)))
+
+# ---- 2. Bootstrap attenuation: RHR ----
+att_rhr_rr <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_rhr_baseline,
+  formula_adj = RHR_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + RHR_person_mean + RR_b + RR_w
+)
+att_summary_rhr_rr <- summarize_attenuation(att_rhr_rr)
+
+# ---- 3. Bootstrap attenuation: HRV ----
+att_hrv_rr <- bootstrap_attenuation(
+  df_month,
+  formula_base = formula_hrv_baseline,
+  formula_adj = HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + RR_b + RR_w
+)
+att_summary_hrv_rr <- summarize_attenuation(att_hrv_rr)
+
+# ---- 4. Within-person RR-HRV coupling (context for the response letter) ----
+model_hrv_rr_coef <- bam(
+  HRV_within ~ s(MONTH_NUM, bs = "cc", k = 12) + s(AGE_2023) + GENDER + BMI + HRV_person_mean + RR_b + RR_w,
+  data = df_month,
+  method = "fREML", knots = MONTH_KNOTS,
+  discrete = TRUE
+)
+cat(sprintf("Within-person RR-HRV coupling: %.2f ms per breath/min (p = %.2g)\n",
+            coef(model_hrv_rr_coef)["RR_w"],
+            summary(model_hrv_rr_coef)$p.table["RR_w", "Pr(>|t|)"]))
 ```
 
 # AIM 3
@@ -2724,6 +2962,515 @@ p_s9b <- ggplot(state_summary_hrv, aes(x = DAYLIGHT_AMP, y = mean_amp)) +
   scale_y_continuous(name = "HRV Amplitude (Aug − Dec, ms)") +
   theme_seasonality()
 p_s9b
+```
+
+
+### Geographic Temperature Amplitude: Regression + Figures
+```{r}
+# Mirrors the daylight-amplitude analysis above, substituting annual TEMPERATURE
+# amplitude (August minus December statewide mean temperature) for annual
+# daylight amplitude. Addresses reviewer requests to test whether participants in
+# regions with larger seasonal temperature swings show larger seasonal RHR/HRV
+# amplitude.
+#
+# Temperature amplitude is not redundant with daylight amplitude: daylight
+# amplitude is a deterministic function of latitude alone, whereas temperature
+# amplitude also reflects continentality, elevation, and maritime influence.
+# States at matched latitude (e.g., CA vs KS) share a daylight amplitude but
+# differ markedly in temperature amplitude, so this analysis accesses
+# between-state variation the photoperiod model structurally could not.
+
+# ---- Data source ----
+# NOAA NCEI Climate at a Glance, Statewide Mapping:
+#   https://www.ncei.noaa.gov/access/monitoring/climate-at-a-glance/statewide/mapping
+# Parameter = Average Temperature, Time Scale = 1-Month, Month = August (then
+# December), Year = study year. The mapping product returns all states in one
+# CSV, so this is two downloads rather than fifty.
+#
+# Expected input: a CSV with columns STATE (name or 2-letter abbreviation),
+# MONTH_NUM (8 or 12), and TAVG (statewide mean temperature).
+
+TEMP_FILE       <- file.path(BASE_DIR, "noaa_state_monthly_temp.csv")
+TEMP_INPUT_IS_F <- TRUE   # NOAA statewide output is degrees Fahrenheit
+
+if (!file.exists(TEMP_FILE)) {
+  stop("Temperature file not found: ", TEMP_FILE,
+       "\nDownload August and December statewide average temperature from NOAA ",
+       "Climate at a Glance (statewide mapping) and combine into a CSV with ",
+       "columns STATE, MONTH_NUM, TAVG.")
+}
+
+state_temp_raw <- readr::read_csv(TEMP_FILE, show_col_types = FALSE)
+
+# Normalize full state names to 2-letter abbreviations to match df_month$STATE
+if (any(nchar(state_temp_raw$STATE) > 2, na.rm = TRUE)) {
+  state_temp_raw <- state_temp_raw %>%
+    mutate(STATE = ifelse(nchar(STATE) > 2, state.abb[match(STATE, state.name)], STATE))
+}
+
+# Annual temperature amplitude = August mean − December mean (degrees C)
+state_temp <- state_temp_raw %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(TAVG_C = if (TEMP_INPUT_IS_F) (TAVG - 32) * 5/9 else TAVG) %>%
+  select(STATE, MONTH_NUM, TAVG_C) %>%
+  pivot_wider(names_from = MONTH_NUM, values_from = TAVG_C, names_prefix = "T") %>%
+  mutate(TEMP_AMP = T8 - T12) %>%
+  select(STATE, TEMP_AMP, T_AUG_STATE = T8) %>%  # R1: retain August mean for state-level sensitivity
+  drop_na(STATE, TEMP_AMP)
+
+# ---- User-level Aug/Dec amplitudes joined to temperature amplitude (RHR) ----
+df_amp_rhr_temp <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(SEASON = ifelse(MONTH_NUM == 8, "August", "December")) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_val = mean(RHR_within, na.rm = TRUE),
+    STATE = first(na.omit(STATE)),
+    AGE_2023 = first(AGE_2023),
+    GENDER = first(GENDER),
+    BMI = first(BMI),
+    RHR_person_mean = first(RHR_person_mean),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_val) %>%
+  mutate(amplitude = December - August) %>%
+  left_join(state_temp, by = "STATE") %>%
+  left_join(state_lat %>% select(STATE, DAYLIGHT_AMP), by = "STATE") %>%
+  drop_na(TEMP_AMP, amplitude)
+
+# ---- User-level Aug/Dec amplitudes joined to temperature amplitude (HRV) ----
+df_amp_hrv_temp <- df_month %>%
+  filter(MONTH_NUM %in% c(8, 12)) %>%
+  mutate(SEASON = ifelse(MONTH_NUM == 8, "August", "December")) %>%
+  group_by(USER_ID, SEASON) %>%
+  summarise(
+    mean_val = mean(HRV_within, na.rm = TRUE),
+    STATE = first(na.omit(STATE)),
+    AGE_2023 = first(AGE_2023),
+    GENDER = first(GENDER),
+    BMI = first(BMI),
+    HRV_person_mean = first(HRV_person_mean),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = SEASON, values_from = mean_val) %>%
+  mutate(amplitude = August - December) %>%
+  left_join(state_temp, by = "STATE") %>%
+  left_join(state_lat %>% select(STATE, DAYLIGHT_AMP), by = "STATE") %>%
+  drop_na(TEMP_AMP, amplitude)
+
+# ---- Linear regressions: amplitude ~ annual temperature amplitude + covariates ----
+model_rhr_temp <- lm(amplitude ~ TEMP_AMP + AGE_2023 + GENDER + BMI + RHR_person_mean,
+                     data = df_amp_rhr_temp)
+model_hrv_temp <- lm(amplitude ~ TEMP_AMP + AGE_2023 + GENDER + BMI + HRV_person_mean,
+                     data = df_amp_hrv_temp)
+
+temp_results <- tibble::tibble(
+  Outcome   = c("RHR", "HRV"),
+  beta_temp = c(coef(model_rhr_temp)["TEMP_AMP"],
+                coef(model_hrv_temp)["TEMP_AMP"]),
+  ci_low    = c(confint(model_rhr_temp)["TEMP_AMP", 1],
+                confint(model_hrv_temp)["TEMP_AMP", 1]),
+  ci_high   = c(confint(model_rhr_temp)["TEMP_AMP", 2],
+                confint(model_hrv_temp)["TEMP_AMP", 2]),
+  p_value   = c(summary(model_rhr_temp)$coefficients["TEMP_AMP", "Pr(>|t|)"],
+                summary(model_hrv_temp)$coefficients["TEMP_AMP", "Pr(>|t|)"]),
+  n         = c(nrow(df_amp_rhr_temp), nrow(df_amp_hrv_temp))
+)
+print(temp_results)
+
+# ---- Sensitivity: cluster-robust SEs by state ----
+# TEMP_AMP is identical for all users in a state, so OLS treats clustered
+# observations as independent. Cluster-robust standard errors account for
+# within-state correlation.
+vcov_cluster_rhr_temp <- vcovCL(model_rhr_temp, cluster = ~ STATE)
+vcov_cluster_hrv_temp <- vcovCL(model_hrv_temp, cluster = ~ STATE)
+
+coeftest_rhr_temp_cluster <- coeftest(model_rhr_temp, vcov = vcov_cluster_rhr_temp)
+coeftest_hrv_temp_cluster <- coeftest(model_hrv_temp, vcov = vcov_cluster_hrv_temp)
+
+ci_rhr_temp_cluster <- coefci(model_rhr_temp, vcov = vcov_cluster_rhr_temp)
+ci_hrv_temp_cluster <- coefci(model_hrv_temp, vcov = vcov_cluster_hrv_temp)
+
+temp_results_cluster <- tibble::tibble(
+  Outcome   = c("RHR", "HRV"),
+  beta_temp = c(coef(model_rhr_temp)["TEMP_AMP"],
+                coef(model_hrv_temp)["TEMP_AMP"]),
+  ci_low    = c(ci_rhr_temp_cluster["TEMP_AMP", 1],
+                ci_hrv_temp_cluster["TEMP_AMP", 1]),
+  ci_high   = c(ci_rhr_temp_cluster["TEMP_AMP", 2],
+                ci_hrv_temp_cluster["TEMP_AMP", 2]),
+  p_value   = c(coeftest_rhr_temp_cluster["TEMP_AMP", "Pr(>|t|)"],
+                coeftest_hrv_temp_cluster["TEMP_AMP", "Pr(>|t|)"]),
+  n_users   = c(nrow(df_amp_rhr_temp), nrow(df_amp_hrv_temp)),
+  n_states  = c(length(unique(df_amp_rhr_temp$STATE)), length(unique(df_amp_hrv_temp$STATE)))
+)
+print(temp_results_cluster)
+
+temp_comparison <- bind_rows(
+  temp_results         %>% select(Outcome, beta_temp, ci_low, ci_high, p_value) %>% mutate(SE_method = "OLS"),
+  temp_results_cluster %>% select(Outcome, beta_temp, ci_low, ci_high, p_value) %>% mutate(SE_method = "Cluster-robust (state)")
+) %>%
+  select(SE_method, Outcome, beta_temp, ci_low, ci_high, p_value)
+print(temp_comparison)
+
+# ---- R1: statewide August mean temperature (same framework; Table S5, Figure S5E-F) ----
+# Directional-consistency check for the city-level August mean temperature
+# association: the state-level estimate is expected to be similar in magnitude
+# but noisier, given coarser exposure assignment.
+model_rhr_aug_state <- lm(amplitude ~ T_AUG_STATE + AGE_2023 + GENDER + BMI + RHR_person_mean,
+                          data = df_amp_rhr_temp)
+model_hrv_aug_state <- lm(amplitude ~ T_AUG_STATE + AGE_2023 + GENDER + BMI + HRV_person_mean,
+                          data = df_amp_hrv_temp)
+vcov_aug_rhr <- vcovCL(model_rhr_aug_state, cluster = ~ STATE)
+vcov_aug_hrv <- vcovCL(model_hrv_aug_state, cluster = ~ STATE)
+
+state_aug_results <- dplyr::bind_rows(lapply(
+  list(list(m = model_rhr_aug_state, vc = vcov_aug_rhr, oc = "RHR"),
+       list(m = model_hrv_aug_state, vc = vcov_aug_hrv, oc = "HRV")),
+  function(set) {
+    m <- set$m; vc <- set$vc
+    dplyr::bind_rows(
+      tibble::tibble(Outcome = set$oc, SE_method = "OLS",
+        beta_aug = coef(m)["T_AUG_STATE"],
+        ci_low = confint(m)["T_AUG_STATE", 1], ci_high = confint(m)["T_AUG_STATE", 2],
+        p_value = summary(m)$coefficients["T_AUG_STATE", "Pr(>|t|)"]),
+      tibble::tibble(Outcome = set$oc, SE_method = "Cluster-robust (state)",
+        beta_aug = coef(m)["T_AUG_STATE"],
+        ci_low = coefci(m, vcov = vc)["T_AUG_STATE", 1], ci_high = coefci(m, vcov = vc)["T_AUG_STATE", 2],
+        p_value = coeftest(m, vcov = vc)["T_AUG_STATE", "Pr(>|t|)"]))
+  }
+))
+print(state_aug_results)
+
+# cluster rows in beta_inset_layer format (for Figure S5E-F insets)
+state_aug_cluster <- state_aug_results %>%
+  filter(SE_method == "Cluster-robust (state)") %>%
+  rename(beta_daylight = beta_aug)
+
+# ---- Figure S5E-F: state-level scatter for August mean temperature ----
+state_summary_rhr_aug <- df_amp_rhr_temp %>%
+  group_by(STATE, T_AUG_STATE) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE), n_users = dplyr::n(), .groups = "drop")
+state_summary_hrv_aug <- df_amp_hrv_temp %>%
+  group_by(STATE, T_AUG_STATE) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE), n_users = dplyr::n(), .groups = "drop")
+
+make_state_aug_pred <- function(d, model, vc, pm_name) {
+  g <- data.frame(
+    T_AUG_STATE = seq(min(d$T_AUG_STATE), max(d$T_AUG_STATE), length.out = 200),
+    AGE_2023 = mean(d$AGE_2023, na.rm = TRUE),
+    GENDER = factor(levels(d$GENDER)[1], levels = levels(d$GENDER)),
+    BMI = mean(d$BMI, na.rm = TRUE))
+  g[[pm_name]] <- mean(d[[pm_name]], na.rm = TRUE)
+  X <- model.matrix(as.formula(paste("~ T_AUG_STATE + AGE_2023 + GENDER + BMI +", pm_name)), data = g)
+  g$fit <- as.vector(X %*% coef(model))
+  g$se  <- sqrt(diag(X %*% vc %*% t(X)))
+  g$lwr <- g$fit - 1.96 * g$se; g$upr <- g$fit + 1.96 * g$se
+  g
+}
+pred_rhr_aug <- make_state_aug_pred(df_amp_rhr_temp, model_rhr_aug_state, vcov_aug_rhr, "RHR_person_mean")
+pred_hrv_aug <- make_state_aug_pred(df_amp_hrv_temp, model_hrv_aug_state, vcov_aug_hrv, "HRV_person_mean")
+
+p_taug_a <- ggplot(state_summary_rhr_aug, aes(x = T_AUG_STATE, y = mean_amp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  geom_ribbon(data = pred_rhr_aug, aes(x = T_AUG_STATE, ymin = lwr, ymax = upr),
+              fill = "#D62728", alpha = 0.25, inherit.aes = FALSE) +
+  geom_line(data = pred_rhr_aug, aes(x = T_AUG_STATE, y = fit),
+            color = "#D62728", linewidth = 1, inherit.aes = FALSE) +
+  geom_point(aes(size = n_users), alpha = 0.75, color = "gray25") +
+  scale_size_continuous(name = "N per State", range = c(1.5, 8)) +
+  scale_x_continuous(name = "August Mean Temperature (°C)") +
+  scale_y_continuous(name = "RHR Amplitude (Dec − Aug, bpm)") +
+  theme_seasonality()
+
+p_taug_b <- ggplot(state_summary_hrv_aug, aes(x = T_AUG_STATE, y = mean_amp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  geom_ribbon(data = pred_hrv_aug, aes(x = T_AUG_STATE, ymin = lwr, ymax = upr),
+              fill = "#1F77B4", alpha = 0.25, inherit.aes = FALSE) +
+  geom_line(data = pred_hrv_aug, aes(x = T_AUG_STATE, y = fit),
+            color = "#1F77B4", linewidth = 1, inherit.aes = FALSE) +
+  geom_point(aes(size = n_users), alpha = 0.75, color = "gray25") +
+  scale_size_continuous(name = "N per State", range = c(1.5, 8)) +
+  scale_x_continuous(name = "August Mean Temperature (°C)") +
+  scale_y_continuous(name = "HRV Amplitude (Aug − Dec, ms)") +
+  theme_seasonality()
+p_taug_a
+p_taug_b
+
+# ---- How much new information does temperature add over daylight? ----
+env_compare <- state_lat %>%
+  select(STATE, DAYLIGHT_AMP) %>%
+  inner_join(state_temp, by = "STATE")
+cor_env <- cor(env_compare$DAYLIGHT_AMP, env_compare$TEMP_AMP, use = "complete.obs")
+cat(sprintf("State-level correlation, daylight vs temperature amplitude: r = %.3f (n = %d states)\n",
+            cor_env, nrow(env_compare)))
+
+# Joint models: is temperature amplitude associated with seasonal amplitude
+# conditional on daylight amplitude?
+model_rhr_joint <- lm(amplitude ~ TEMP_AMP + DAYLIGHT_AMP + AGE_2023 + GENDER + BMI + RHR_person_mean,
+                      data = df_amp_rhr_temp %>% drop_na(DAYLIGHT_AMP))
+model_hrv_joint <- lm(amplitude ~ TEMP_AMP + DAYLIGHT_AMP + AGE_2023 + GENDER + BMI + HRV_person_mean,
+                      data = df_amp_hrv_temp %>% drop_na(DAYLIGHT_AMP))
+
+cat("\n-- Joint model, RHR (cluster-robust) --\n")
+print(coeftest(model_rhr_joint, vcov = vcovCL(model_rhr_joint, cluster = ~ STATE)))
+cat("\n-- Joint model, HRV (cluster-robust) --\n")
+print(coeftest(model_hrv_joint, vcov = vcovCL(model_hrv_joint, cluster = ~ STATE)))
+
+# ---- State-level summaries for plotting (one point per state, sized by n) ----
+state_summary_rhr_temp <- df_amp_rhr_temp %>%
+  group_by(STATE, TEMP_AMP) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE),
+            n_users = dplyr::n(), .groups = "drop")
+
+state_summary_hrv_temp <- df_amp_hrv_temp %>%
+  group_by(STATE, TEMP_AMP) %>%
+  summarise(mean_amp = mean(amplitude, na.rm = TRUE),
+            n_users = dplyr::n(), .groups = "drop")
+
+# ---- Cluster-robust prediction grids for plotting ----
+# RHR
+pred_rhr_temp <- data.frame(
+  TEMP_AMP        = seq(min(df_amp_rhr_temp$TEMP_AMP),
+                        max(df_amp_rhr_temp$TEMP_AMP), length.out = 200),
+  AGE_2023        = mean(df_amp_rhr_temp$AGE_2023, na.rm = TRUE),
+  GENDER          = factor(levels(df_amp_rhr_temp$GENDER)[1],
+                           levels = levels(df_amp_rhr_temp$GENDER)),
+  BMI             = mean(df_amp_rhr_temp$BMI, na.rm = TRUE),
+  RHR_person_mean = mean(df_amp_rhr_temp$RHR_person_mean, na.rm = TRUE)
+)
+X_rhr_temp <- model.matrix(~ TEMP_AMP + AGE_2023 + GENDER + BMI + RHR_person_mean,
+                           data = pred_rhr_temp)
+pred_rhr_temp$fit <- as.vector(X_rhr_temp %*% coef(model_rhr_temp))
+pred_rhr_temp$se  <- sqrt(diag(X_rhr_temp %*% vcov_cluster_rhr_temp %*% t(X_rhr_temp)))
+pred_rhr_temp$lwr <- pred_rhr_temp$fit - 1.96 * pred_rhr_temp$se
+pred_rhr_temp$upr <- pred_rhr_temp$fit + 1.96 * pred_rhr_temp$se
+
+# HRV
+pred_hrv_temp <- data.frame(
+  TEMP_AMP        = seq(min(df_amp_hrv_temp$TEMP_AMP),
+                        max(df_amp_hrv_temp$TEMP_AMP), length.out = 200),
+  AGE_2023        = mean(df_amp_hrv_temp$AGE_2023, na.rm = TRUE),
+  GENDER          = factor(levels(df_amp_hrv_temp$GENDER)[1],
+                           levels = levels(df_amp_hrv_temp$GENDER)),
+  BMI             = mean(df_amp_hrv_temp$BMI, na.rm = TRUE),
+  HRV_person_mean = mean(df_amp_hrv_temp$HRV_person_mean, na.rm = TRUE)
+)
+X_hrv_temp <- model.matrix(~ TEMP_AMP + AGE_2023 + GENDER + BMI + HRV_person_mean,
+                           data = pred_hrv_temp)
+pred_hrv_temp$fit <- as.vector(X_hrv_temp %*% coef(model_hrv_temp))
+pred_hrv_temp$se  <- sqrt(diag(X_hrv_temp %*% vcov_cluster_hrv_temp %*% t(X_hrv_temp)))
+pred_hrv_temp$lwr <- pred_hrv_temp$fit - 1.96 * pred_hrv_temp$se
+pred_hrv_temp$upr <- pred_hrv_temp$fit + 1.96 * pred_hrv_temp$se
+
+# ---- Figure: RHR amplitude vs annual temperature amplitude ----
+# Points are state-level means (sized by n users); regression line and 95% CI
+# are from a user-level model with state-clustered SEs.
+p_s10a <- ggplot(state_summary_rhr_temp, aes(x = TEMP_AMP, y = mean_amp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  geom_ribbon(data = pred_rhr_temp, aes(x = TEMP_AMP, ymin = lwr, ymax = upr),
+              fill = "#D62728", alpha = 0.25, inherit.aes = FALSE) +
+  geom_line(data = pred_rhr_temp, aes(x = TEMP_AMP, y = fit),
+            color = "#D62728", linewidth = 1, inherit.aes = FALSE) +
+  geom_point(aes(size = n_users), alpha = 0.75, color = "gray25") +
+  scale_size_continuous(name = "N per State", range = c(1.5, 8)) +
+  scale_x_continuous(name = "Annual Temperature Amplitude (Aug − Dec, °C)") +
+  scale_y_continuous(name = "RHR Amplitude (Dec − Aug, bpm)") +
+  theme_seasonality()
+p_s10a
+
+# ---- Figure: HRV amplitude vs annual temperature amplitude ----
+p_s10b <- ggplot(state_summary_hrv_temp, aes(x = TEMP_AMP, y = mean_amp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  geom_ribbon(data = pred_hrv_temp, aes(x = TEMP_AMP, ymin = lwr, ymax = upr),
+              fill = "#1F77B4", alpha = 0.25, inherit.aes = FALSE) +
+  geom_line(data = pred_hrv_temp, aes(x = TEMP_AMP, y = fit),
+            color = "#1F77B4", linewidth = 1, inherit.aes = FALSE) +
+  geom_point(aes(size = n_users), alpha = 0.75, color = "gray25") +
+  scale_size_continuous(name = "N per State", range = c(1.5, 8)) +
+  scale_x_continuous(name = "Annual Temperature Amplitude (Aug − Dec, °C)") +
+  scale_y_continuous(name = "HRV Amplitude (Aug − Dec, ms)") +
+  theme_seasonality()
+p_s10b
+
+# To add the beta annotation used for the daylight figures, rename the column
+# the helper expects:
+# p_s10a + beta_inset_layer(dplyr::rename(temp_results_cluster,
+#                                         beta_daylight = beta_temp), "RHR", "bpm/°C")
+```
+
+
+### City-Level Sensitivity: Photoperiod, Temperature Amplitude, August Mean Temperature (Table S6)
+```{r}
+# R1 (Reviewers 3, 5.2; see also 1.7): finer-resolution sensitivity analysis in
+# the geocodable subset. User-entered city of residence is geocoded to
+# coordinates; exposures are (i) annual daylight amplitude from city latitude,
+# (ii) Aug-Dec temperature amplitude, and (iii) August mean temperature, the
+# latter two from ERA5-based reanalysis (Open-Meteo Historical Weather API) at
+# city coordinates for 2023 (archived in city_temps_aug_dec_2023.csv; fetch
+# code in the eval=FALSE chunk below).
+#
+# Exposures are reported marginally only: August mean temperature is the
+# algebraic sum of December mean temperature and Aug-Dec amplitude, and
+# correlates about -0.69 with daylight amplitude, precluding stable joint
+# estimation. City- and state-clustered SEs are both reported because these
+# exposures are spatially smooth: city clustering treats nearby cities as
+# independent (anti-conservative); state clustering discards within-state
+# exposure information (conservative).
+
+GEOCODE_FILE <- file.path(BASE_DIR, "us_cities_geocodes.csv")
+CITY_TEMP_FILE <- file.path(BASE_DIR, "city_temps_aug_dec_2023.csv")
+
+# ---- 1. Geocode users by city + state ----
+norm_city <- function(x){
+  x <- tolower(trimws(x))
+  x <- gsub("^st\\.? ", "saint ", x)
+  x <- gsub("^ft\\.? ", "fort ", x)
+  x <- gsub("^mt\\.? ", "mount ", x)
+  x
+}
+geocodes <- readr::read_csv(GEOCODE_FILE, show_col_types = FALSE) %>%
+  mutate(key = paste(norm_city(CITY), STATE_CODE)) %>%
+  group_by(key) %>%
+  summarise(CITY_LAT = mean(LATITUDE), CITY_LON = mean(LONGITUDE), .groups = "drop")
+
+user_city <- df %>%
+  group_by(USER_ID) %>%
+  summarise(USER_CITY = first(na.omit(CITY)), USER_STATE = first(na.omit(STATE)), .groups = "drop") %>%
+  filter(!is.na(USER_CITY), USER_CITY != "", !is.na(USER_STATE), USER_STATE != "") %>%
+  mutate(key = paste(norm_city(USER_CITY), USER_STATE)) %>%
+  left_join(geocodes, by = "key") %>%
+  filter(!is.na(CITY_LAT))
+
+# ---- 2. City-level exposures ----
+city_temps <- readr::read_csv(CITY_TEMP_FILE, show_col_types = FALSE)
+user_city <- user_city %>%
+  mutate(
+    CITY_DL_AMP = daylight_hours(CITY_LAT, 173) - daylight_hours(CITY_LAT, 355),
+    rlat = round(CITY_LAT, 1), rlon = round(CITY_LON, 1)
+  ) %>%
+  inner_join(city_temps, by = c("rlat", "rlon")) %>%
+  select(USER_ID, USER_CITY, USER_STATE, CITY_DL_AMP, TEMP_AMP_CITY = TEMP_AMP, T_AUG) %>%
+  mutate(USER_ID = as.character(USER_ID))  # df_month$USER_ID is a factor; join on character
+
+cat(sprintf("Geocodable subset with temperature data: %d users (%.1f%% of cohort)\n",
+            nrow(user_city), 100 * nrow(user_city) / n_distinct(df_month$USER_ID)))
+
+# ---- 3. Person-level Aug/Dec amplitudes joined to city exposures ----
+make_city_amp <- function(wcol, pmcol, dec_minus_aug) {
+  df_month %>%
+    filter(MONTH_NUM %in% c(8, 12)) %>%
+    mutate(SEASON = ifelse(MONTH_NUM == 8, "August", "December")) %>%
+    group_by(USER_ID, SEASON) %>%
+    summarise(
+      mean_val = mean(.data[[wcol]], na.rm = TRUE),
+      AGE_2023 = first(AGE_2023), GENDER = first(GENDER), BMI = first(BMI),
+      PM = first(.data[[pmcol]]), .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(names_from = SEASON, values_from = mean_val) %>%
+    mutate(amplitude = if (dec_minus_aug) December - August else August - December,
+           USER_ID = as.character(USER_ID)) %>%
+    inner_join(user_city, by = "USER_ID") %>%
+    tidyr::drop_na(amplitude, BMI)
+}
+df_city_rhr <- make_city_amp("RHR_within", "RHR_person_mean", TRUE)
+df_city_hrv <- make_city_amp("HRV_within", "HRV_person_mean", FALSE)
+
+# ---- 4. Marginal regressions: 3 exposures x 2 outcomes x 2 clusterings ----
+city_sens_results <- dplyr::bind_rows(lapply(
+  list(list(d = df_city_rhr, oc = "RHR"), list(d = df_city_hrv, oc = "HRV")),
+  function(set) {
+    d <- set$d
+    base <- lm(amplitude ~ AGE_2023 + GENDER + BMI + PM, data = d)
+    dplyr::bind_rows(lapply(c("CITY_DL_AMP", "TEMP_AMP_CITY", "T_AUG"), function(v) {
+      m <- lm(as.formula(paste("amplitude ~", v, "+ AGE_2023 + GENDER + BMI + PM")), data = d)
+      dplyr::bind_rows(lapply(c("USER_CITY", "USER_STATE"), function(cl) {
+        vc <- vcovCL(m, cluster = d[[cl]])
+        ct <- coeftest(m, vcov = vc)[v, ]
+        ci <- coefci(m, vcov = vc)[v, ]
+        tibble::tibble(
+          Outcome = set$oc, Exposure = v,
+          SE_method = ifelse(cl == "USER_CITY", "Cluster-robust (city)", "Cluster-robust (state)"),
+          beta = ct[1], ci_low = ci[1], ci_high = ci[2], p_value = ct[4],
+          std_beta = coef(m)[v] * sd(d[[v]]) / sd(d$amplitude),
+          partial_R2_pct = 100 * (summary(m)$r.squared - summary(base)$r.squared),
+          n = nrow(d)
+        )
+      }))
+    }))
+  }
+))
+print(city_sens_results, n = 24)
+
+# ---- 5. Figure S6 panels: city-level scatter + fitted line (6 panels) ----
+# Points are city-level mean amplitudes (sized by n users); fitted line and 95%
+# CI are from the user-level marginal model with state-clustered SEs
+# (conservative, matching the primary inference in Table S7).
+make_city_panel <- function(d, xvar, xlab, ylab, color) {
+  mod <- lm(as.formula(paste("amplitude ~", xvar, "+ AGE_2023 + GENDER + BMI + PM")), data = d)
+  vc  <- vcovCL(mod, cluster = d$USER_STATE)
+  grid <- data.frame(
+    x = seq(min(d[[xvar]]), max(d[[xvar]]), length.out = 200),
+    AGE_2023 = mean(d$AGE_2023, na.rm = TRUE),
+    GENDER = factor(levels(d$GENDER)[1], levels = levels(d$GENDER)),
+    BMI = mean(d$BMI, na.rm = TRUE),
+    PM = mean(d$PM, na.rm = TRUE)
+  )
+  names(grid)[1] <- xvar
+  X <- model.matrix(as.formula(paste("~", xvar, "+ AGE_2023 + GENDER + BMI + PM")), data = grid)
+  grid$fit <- as.vector(X %*% coef(mod))
+  grid$se  <- sqrt(diag(X %*% vc %*% t(X)))
+  grid$lwr <- grid$fit - 1.96 * grid$se
+  grid$upr <- grid$fit + 1.96 * grid$se
+  citysum <- d %>%
+    group_by(USER_CITY, USER_STATE) %>%
+    summarise(xv = first(.data[[xvar]]), mean_amp = mean(amplitude, na.rm = TRUE),
+              n_users = dplyr::n(), .groups = "drop")
+  # state-clustered beta/CI/p annotation (matches Table S6 primary inference)
+  ct <- lmtest::coeftest(mod, vcov = vc)
+  ci <- lmtest::coefci(mod, vcov = vc)
+  p_val <- ct[xvar, "Pr(>|t|)"]
+  p_str <- if (p_val < 0.001) "P < 0.001" else sprintf("P = %.3f", p_val)
+  beta_lab <- sprintf("β = %.3f (95%% CI: %.3f, %.3f); %s",
+                      ct[xvar, "Estimate"], ci[xvar, 1], ci[xvar, 2], p_str)
+  ggplot(citysum, aes(x = xv, y = mean_amp)) +
+    ggpp::geom_label_npc(
+      data = tibble(npcx = 0.03, npcy = 0.97, label = beta_lab),
+      aes(npcx = npcx, npcy = npcy, label = label),
+      hjust = 0, vjust = 1, size = 3, color = "black",
+      label.size = 0.3, fill = scales::alpha("white", 0.85),
+      label.padding = unit(0.3, "lines"), inherit.aes = FALSE) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+    geom_ribbon(data = grid, aes(x = .data[[xvar]], ymin = lwr, ymax = upr),
+                fill = color, alpha = 0.25, inherit.aes = FALSE) +
+    geom_line(data = grid, aes(x = .data[[xvar]], y = fit),
+              color = color, linewidth = 1, inherit.aes = FALSE) +
+    geom_point(aes(size = n_users), alpha = 0.35, color = "gray25") +
+    scale_size_continuous(name = "N per City", range = c(0.8, 6)) +
+    scale_x_continuous(name = xlab) +
+    scale_y_continuous(name = ylab) +
+    theme_seasonality()
+}
+
+p_city_rhr_dl   <- make_city_panel(df_city_rhr, "CITY_DL_AMP",   "Annual Daylight Amplitude (h)",          "RHR Amplitude (Dec − Aug, bpm)", "#D62728")
+p_city_rhr_temp <- make_city_panel(df_city_rhr, "TEMP_AMP_CITY", "Temperature Amplitude (Aug − Dec, °C)",  "RHR Amplitude (Dec − Aug, bpm)", "#D62728")
+p_city_rhr_aug  <- make_city_panel(df_city_rhr, "T_AUG",         "August Mean Temperature (°C)",           "RHR Amplitude (Dec − Aug, bpm)", "#D62728")
+p_city_hrv_dl   <- make_city_panel(df_city_hrv, "CITY_DL_AMP",   "Annual Daylight Amplitude (h)",          "HRV Amplitude (Aug − Dec, ms)",  "#1F77B4")
+p_city_hrv_temp <- make_city_panel(df_city_hrv, "TEMP_AMP_CITY", "Temperature Amplitude (Aug − Dec, °C)",  "HRV Amplitude (Aug − Dec, ms)",  "#1F77B4")
+p_city_hrv_aug  <- make_city_panel(df_city_hrv, "T_AUG",         "August Mean Temperature (°C)",           "HRV Amplitude (Aug − Dec, ms)",  "#1F77B4")
+```
+
+```{r eval=FALSE}
+# ---- Provenance: Open-Meteo fetch used to build city_temps_aug_dec_2023.csv ----
+# Not evaluated on render; archived for reproducibility. Fetches daily mean
+# 2-m temperature for Aug and Dec 2023 at each unique city coordinate
+# (rounded to 0.1 degrees), in batches with rate-limit backoff.
+# API: https://archive-api.open-meteo.com/v1/archive
+#   ?latitude=..&longitude=..&start_date=2023-08-01&end_date=2023-08-31
+#   &daily=temperature_2m_mean&timezone=UTC
+# T_AUG / T_DEC = mean of daily values within each window; TEMP_AMP = T_AUG - T_DEC.
+# Approximately 500 of 2,721 coordinate points failed persistent rate limits at
+# first fetch; the archived file contains 2,221 points covering 9,433 users.
 ```
 
 
@@ -3809,9 +4556,13 @@ model_sleep <- gam(MINUTES_OF_SLEEP ~ s(MONTH_NUM, bs = "cc", k = 12),
 model_activity <- gam(SHRZS ~ s(MONTH_NUM, bs = "cc", k = 12),
                       data = df_month, method = "REML", knots = MONTH_KNOTS)
 
+model_consistency <- gam(SLEEP_CONSISTENCY ~ s(MONTH_NUM, bs = "cc", k = 12),
+                         data = df_month, method = "REML", knots = MONTH_KNOTS)
+
 # 2. Extract smooth fits with visreg
 vis_sleep <- visreg(model_sleep, xvar = "MONTH_NUM", plot = FALSE)
 vis_activity <- visreg(model_activity, xvar = "MONTH_NUM", plot = FALSE)
+vis_consistency <- visreg(model_consistency, xvar = "MONTH_NUM", plot = FALSE)
 
 # 3. Build tidy data frames for plotting
 df_sleep <- vis_sleep$fit %>%
@@ -3820,10 +4571,14 @@ df_sleep <- vis_sleep$fit %>%
 df_activity <- vis_activity$fit %>%
   mutate(Behavior = "Physical Activity (SHRZS)")
 
+df_consistency <- vis_consistency$fit %>%
+  mutate(Behavior = "Sleep Consistency (%)")
+
 # 4. Define custom colors
 behavior_colors <- c(
   "Sleep Duration (min/night)" = "#fc8d62",     # Orange
-  "Physical Activity (SHRZS)" = "#1f78b4"       # Blue
+  "Physical Activity (SHRZS)" = "#1f78b4",      # Blue
+  "Sleep Consistency (%)" = "#33a02c"           # Green
 )
 
 # 5. Plot each behavior separately (Figure 3a-b)
@@ -3846,8 +4601,18 @@ p_fig3a <- ggplot(df_activity, aes(x = MONTH_NUM, y = visregFit)) +
   ylab("Physical Activity (SHRZS)") +
   theme_seasonality(legend = FALSE)
 
+# --- Sleep Consistency (Figure 3c) ---
+p_fig3c <- ggplot(df_consistency, aes(x = MONTH_NUM, y = visregFit)) +
+  geom_line(color = behavior_colors["Sleep Consistency (%)"], linewidth = 1.2) +
+  geom_ribbon(aes(ymin = visregLwr, ymax = visregUpr),
+              fill = behavior_colors["Sleep Consistency (%)"], alpha = 0.3) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, name = NULL) +
+  ylab("Sleep Consistency (%)") +
+  theme_seasonality(legend = FALSE)
+
 p_fig3a
 p_fig3b
+p_fig3c
 
 get_peak_nadir <- function(df, behavior_label) {
   df <- df %>% mutate(Behavior = behavior_label)
@@ -3864,10 +4629,12 @@ get_peak_nadir <- function(df, behavior_label) {
 
 extremes_sleep <- get_peak_nadir(df_sleep, "Sleep Duration (min/night)")
 extremes_activity <- get_peak_nadir(df_activity, "Physical Activity (SHRZS)")
+extremes_consistency <- get_peak_nadir(df_consistency, "Sleep Consistency (%)")
 
 all_extremes <- bind_rows(
   extremes_sleep,
-  extremes_activity
+  extremes_activity,
+  extremes_consistency
 )
 
 # Add readable month name
@@ -3892,17 +4659,29 @@ model_activity <- gam(
   data = df_month, method = "REML", knots = MONTH_KNOTS
 )
 
+# R1: age-stratified sleep consistency added alongside PA and sleep duration
+model_consistency_age <- gam(
+  SLEEP_CONSISTENCY ~ s(MONTH_NUM, bs = "cc", k = 12, by = AGE_BUCKET) + AGE_BUCKET,
+  data = df_month, method = "REML", knots = MONTH_KNOTS
+)
+
 vis_sleep <- visreg(model_sleep, xvar = "MONTH_NUM", by = "AGE_BUCKET",
                     overlay = FALSE, plot = FALSE)
 
 vis_activity <- visreg(model_activity, xvar = "MONTH_NUM", by = "AGE_BUCKET",
                        overlay = FALSE, plot = FALSE)
 
+vis_consistency_age <- visreg(model_consistency_age, xvar = "MONTH_NUM", by = "AGE_BUCKET",
+                              overlay = FALSE, plot = FALSE)
+
 df_sleep_age <- vis_sleep$fit %>%
   mutate(Behavior = "Sleep Duration (min/night)")
 
 df_activity_age <- vis_activity$fit %>%
   mutate(Behavior = "Physical Activity (SHRZS)")
+
+df_consistency_age <- vis_consistency_age$fit %>%
+  mutate(Behavior = "Sleep Consistency (%)")
 
 age_linetypes <- c(
   "Young" = "solid",
@@ -3930,8 +4709,12 @@ p_s4b <- plot_behavior(df_sleep_age,
 p_s4a <- plot_behavior(df_activity_age,
                        behavior_colors["Physical Activity (SHRZS)"])
 
+p_s4c <- plot_behavior(df_consistency_age,
+                       behavior_colors["Sleep Consistency (%)"])
+
 p_s4a
 p_s4b
+p_s4c
 
 legend_df <- data.frame(
   AGE_BUCKET = c("Young", "Middle", "Old"),
@@ -3964,8 +4747,8 @@ age_bucket_legend_horizontal
 ### Assemble Multi-Panel Figures
 ```{r, fig.width=14, fig.height=12}
 # Assembles Figures 1-4 from component plots created above and writes PDF+PNG to the Main Figures directory.
-fig_dir <- "/Users/gregory.grosicki/Desktop/Seasonality/Main Figures"
-sup_dir <- "/Users/gregory.grosicki/Desktop/Seasonality/Supplementary Figures"
+fig_dir <- file.path(BASE_DIR, "Main Figures")
+sup_dir <- file.path(BASE_DIR, "Supplementary Figures")
 
 # ---- Figure 1: RHR and HRV by Age Group (2x2) ----
 fig1 <- ((p_fig1a + p_fig1b) / (p_fig1c + p_fig1d)) +
@@ -3987,14 +4770,15 @@ ggsave(file.path(fig_dir, "Figure_2.png"), fig2, width = 14, height = 10, dpi = 
 fig3_theme <- theme(axis.text = element_text(size = 12, face = "bold"),
                     axis.title = element_text(size = 14, face = "bold"))
 
-fig3 <- ((p_fig3a + fig3_theme) + (p_fig3b + fig3_theme)) /
-        ((p_fig3d + fig3_theme) + (p_fig3e + fig3_theme)) /
-        ((p_fig3g + fig3_theme) + (p_fig3h + fig3_theme)) +
+# R1: third column added for sleep consistency (panels C, F, I)
+fig3 <- ((p_fig3a + fig3_theme) + (p_fig3b + fig3_theme) + (p_fig3c + fig3_theme)) /
+        ((p_fig3d + fig3_theme) + (p_fig3e + fig3_theme) + (p_fig3f + fig3_theme)) /
+        ((p_fig3g + fig3_theme) + (p_fig3h + fig3_theme) + (p_fig3i + fig3_theme)) +
   plot_annotation(tag_levels = "A") +
   theme(plot.tag = element_text(size = 18, face = "bold"))
 fig3
-ggsave(file.path(fig_dir, "Figure_3.pdf"), fig3, width = 16, height = 14, dpi = 300)
-ggsave(file.path(fig_dir, "Figure_3.png"), fig3, width = 16, height = 14, dpi = 300)
+ggsave(file.path(fig_dir, "Figure_3.pdf"), fig3, width = 21, height = 14, dpi = 300)
+ggsave(file.path(fig_dir, "Figure_3.png"), fig3, width = 21, height = 14, dpi = 300)
 
 # ---- Figure 4: PA Level and BMI Moderation (2x2) ----
 fig4 <- ((p_fig4a + p_fig4b) / (p_fig4c + p_fig4d)) +
@@ -4031,66 +4815,87 @@ fig_s3
 ggsave(file.path(sup_dir, "Figure_S3.pdf"), fig_s3, width = 14, height = 10, dpi = 300)
 ggsave(file.path(sup_dir, "Figure_S3.png"), fig_s3, width = 14, height = 10, dpi = 300)
 
-# ---- Figure S4: Behavioral Patterns by Age Group (1x2) ----
-fig_s4 <- (p_s4a + p_s4b + plot_layout(ncol = 2)) +
+# ---- Figure S4: Behavioral Patterns by Age Group (1x3; R1 added consistency) ----
+fig_s4 <- (p_s4a + p_s4b + p_s4c + plot_layout(ncol = 3)) +
   plot_annotation(tag_levels = "A") +
   theme(plot.tag = element_text(size = 16, face = "bold"))
 fig_s4
-ggsave(file.path(sup_dir, "Figure_S4.pdf"), fig_s4, width = 12, height = 5, dpi = 300)
-ggsave(file.path(sup_dir, "Figure_S4.png"), fig_s4, width = 12, height = 5, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S4.pdf"), fig_s4, width = 18, height = 5, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S4.png"), fig_s4, width = 18, height = 5, dpi = 300)
 
-# NOTE: After integrating photoperiod into the behavioral-mediation narrative,
-# photoperiod (previously S9) becomes the new Figure S5 (appears first in text),
-# age-stratified all-adjusted becomes the new Figure S6, and the Aim-3 age-stratified
-# moderation figures are S7/S8/S9. Internal R object names (fig_s5, fig_s6, fig_s7,
-# fig_s8, fig_s9) reflect original creation order; saved filenames reflect final
-# numbering.
+# NOTE (R1 final numbering): Figure S5 = state-level geographic exposures
+# (daylight A-B + temperature C-D, 2x2); Figure S6 = city-level sensitivity
+# (photoperiod/temp amplitude/August mean temp x RHR/HRV, 2x3); adjusted-age
+# figure = S7; Aim-3 age-stratified moderation figures = S8/S9/S10. Internal R
+# object names reflect creation order; saved filenames reflect final numbering.
+# All geographic panels carry state-clustered (conservative) beta/CI/P insets,
+# matching Tables S4, S5, and S6.
 
-# ---- Figure S5 (new): RHR and HRV amplitude vs annual daylight amplitude (1x2) ----
-fig_s9 <- (p_s9a + p_s9b) +
+# ---- Figure S5 (R1): state-level daylight (A,B) + temp amplitude (C,D) + August mean temp (E,F) (3x2) ----
+fig_s5_geo <- ((p_s9a + beta_inset_layer(daylight_results_cluster, "RHR", "bpm/h",
+                                         npcx = 0.03, npcy = 0.97, margin_r = 5)) +
+               (p_s9b + beta_inset_layer(daylight_results_cluster, "HRV", "ms/h",
+                                         npcx = 0.03, npcy = 0.97, margin_r = 5))) /
+              ((p_s10a + beta_inset_layer(dplyr::rename(temp_results_cluster, beta_daylight = beta_temp),
+                                          "RHR", "bpm/°C", npcx = 0.03, npcy = 0.97, margin_r = 5)) +
+               (p_s10b + beta_inset_layer(dplyr::rename(temp_results_cluster, beta_daylight = beta_temp),
+                                          "HRV", "ms/°C", npcx = 0.03, npcy = 0.97, margin_r = 5))) /
+              ((p_taug_a + beta_inset_layer(state_aug_cluster, "RHR", "bpm/°C",
+                                            npcx = 0.03, npcy = 0.97, margin_r = 5)) +
+               (p_taug_b + beta_inset_layer(state_aug_cluster, "HRV", "ms/°C",
+                                            npcx = 0.03, npcy = 0.97, margin_r = 5))) +
   plot_annotation(tag_levels = "A") +
   theme(plot.tag = element_text(size = 16, face = "bold"))
-fig_s9
-ggsave(file.path(sup_dir, "Figure_S5.pdf"), fig_s9, width = 14, height = 5, dpi = 300)
-ggsave(file.path(sup_dir, "Figure_S5.png"), fig_s9, width = 14, height = 5, dpi = 300)
+fig_s5_geo
+ggsave(file.path(sup_dir, "Figure_S5.pdf"), fig_s5_geo, width = 14, height = 15, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S5.png"), fig_s5_geo, width = 14, height = 15, dpi = 300)
 
-# ---- Figure S6 (new): Adjusted RHR and HRV by Age (1x2) ----
+# ---- Figure S6 (R1): city-level sensitivity, 2x3 (RHR row; HRV row) ----
+fig_s6_city <- ((p_city_rhr_dl + p_city_rhr_temp + p_city_rhr_aug) /
+                (p_city_hrv_dl + p_city_hrv_temp + p_city_hrv_aug)) +
+  plot_annotation(tag_levels = "A") +
+  theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s6_city
+ggsave(file.path(sup_dir, "Figure_S6.pdf"), fig_s6_city, width = 20, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S6.png"), fig_s6_city, width = 20, height = 10, dpi = 300)
+
+# ---- Figure S7 (R1, was S6): Adjusted RHR and HRV by Age (1x2) ----
 fig_s5 <- (p_s5a + p_s5b) +
   plot_annotation(tag_levels = "A") +
   theme(plot.tag = element_text(size = 16, face = "bold"))
 fig_s5
-ggsave(file.path(sup_dir, "Figure_S6.pdf"), fig_s5, width = 14, height = 5, dpi = 300)
-ggsave(file.path(sup_dir, "Figure_S6.png"), fig_s5, width = 14, height = 5, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S7.pdf"), fig_s5, width = 14, height = 5, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S7.png"), fig_s5, width = 14, height = 5, dpi = 300)
 
-# ---- Figure S7 (new): Young Adults – PA and BMI (2x2) ----
+# ---- Figure S8 (R1, was S7): Young Adults – PA and BMI (2x2) ----
 fig_s6 <- ((p_s6_rhr_pa + p_s6_hrv_pa) / (p_s6_rhr_bmi + p_s6_hrv_bmi)) +
   plot_annotation(tag_levels = "A") +
   theme(plot.tag = element_text(size = 16, face = "bold"))
 fig_s6
-ggsave(file.path(sup_dir, "Figure_S7.pdf"), fig_s6, width = 14, height = 10, dpi = 300)
-ggsave(file.path(sup_dir, "Figure_S7.png"), fig_s6, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S8.pdf"), fig_s6, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S8.png"), fig_s6, width = 14, height = 10, dpi = 300)
 
-# ---- Figure S8 (new): Middle-Aged Adults – PA and BMI (2x2) ----
+# ---- Figure S9 (R1, was S8): Middle-Aged Adults – PA and BMI (2x2) ----
 fig_s7 <- ((p_s7_rhr_pa + p_s7_hrv_pa) / (p_s7_rhr_bmi + p_s7_hrv_bmi)) +
   plot_annotation(tag_levels = "A") +
   theme(plot.tag = element_text(size = 16, face = "bold"))
 fig_s7
-ggsave(file.path(sup_dir, "Figure_S8.pdf"), fig_s7, width = 14, height = 10, dpi = 300)
-ggsave(file.path(sup_dir, "Figure_S8.png"), fig_s7, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S9.pdf"), fig_s7, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S9.png"), fig_s7, width = 14, height = 10, dpi = 300)
 
-# ---- Figure S9 (new): Older Adults – PA and BMI (2x2) ----
+# ---- Figure S10 (R1, was S9): Older Adults – PA and BMI (2x2) ----
 fig_s8 <- ((p_s8_rhr_pa + p_s8_hrv_pa) / (p_s8_rhr_bmi + p_s8_hrv_bmi)) +
   plot_annotation(tag_levels = "A") +
   theme(plot.tag = element_text(size = 16, face = "bold"))
 fig_s8
-ggsave(file.path(sup_dir, "Figure_S9.pdf"), fig_s8, width = 14, height = 10, dpi = 300)
-ggsave(file.path(sup_dir, "Figure_S9.png"), fig_s8, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S10.pdf"), fig_s8, width = 14, height = 10, dpi = 300)
+ggsave(file.path(sup_dir, "Figure_S10.png"), fig_s8, width = 14, height = 10, dpi = 300)
 ```
 
 ### Export Results as CSVs
 ```{r}
 # Exports bootstrap amplitude summaries, pairwise p-values, attenuation estimates, and Aug/Dec contrasts for every aim to the Results CSVs directory. Each numbered block below corresponds to a figure in the paper.
-csv_dir <- "/Users/gregory.grosicki/Desktop/Seasonality/Results CSVs"
+csv_dir <- file.path(BASE_DIR, "Results CSVs")
 dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
 
 # ---- 1. Overall amplitude (Figure S1) ----
@@ -4205,7 +5010,13 @@ attenuation_results <- bind_rows(
   extract_attenuation(att_rhr_pa, "PA") %>% mutate(Outcome = "RHR"),
   extract_attenuation(att_hrv_pa, "PA") %>% mutate(Outcome = "HRV"),
   extract_attenuation(att_rhr_sleep, "Sleep") %>% mutate(Outcome = "RHR"),
-  extract_attenuation(att_hrv_sleep, "Sleep") %>% mutate(Outcome = "HRV")
+  extract_attenuation(att_hrv_sleep, "Sleep") %>% mutate(Outcome = "HRV"),
+  extract_attenuation(att_rhr_cons, "Sleep consistency") %>% mutate(Outcome = "RHR"),
+  extract_attenuation(att_hrv_cons, "Sleep consistency") %>% mutate(Outcome = "HRV"),
+  extract_attenuation(att_rhr_eff, "Sleep efficiency") %>% mutate(Outcome = "RHR"),
+  extract_attenuation(att_hrv_eff, "Sleep efficiency") %>% mutate(Outcome = "HRV"),
+  extract_attenuation(att_rhr_rr, "Respiratory rate") %>% mutate(Outcome = "RHR"),
+  extract_attenuation(att_hrv_rr, "Respiratory rate") %>% mutate(Outcome = "HRV")
 )
 write.csv(attenuation_results, file.path(csv_dir, "attenuation_results.csv"), row.names = FALSE)
 
@@ -4344,8 +5155,35 @@ write.csv(tukey_hrv_age, file.path(csv_dir, "individual_amplitude_tukey_HRV.csv"
   tukey_sex_hrv <- as.data.frame(pairs(emmeans(model_amplitude_gender_hrv, ~ GENDER), adjust = "tukey"))
   write.csv(tukey_sex_hrv, file.path(csv_dir, "individual_amplitude_tukey_sex_HRV.csv"), row.names = FALSE)
 
-# ---- 16. Geographic daylight-amplitude regression (Figure S9) ----
+# ---- 16. Geographic daylight-amplitude regression (Figure S5) ----
 write.csv(daylight_results, file.path(csv_dir, "amplitude_by_daylight.csv"), row.names = FALSE)
+
+# ---- 17. Geographic temperature-amplitude regression (Figure S5, Table S5) ----
+write.csv(temp_comparison, file.path(csv_dir, "amplitude_by_temperature.csv"), row.names = FALSE)
+write.csv(state_aug_results, file.path(csv_dir, "amplitude_by_state_august_temp.csv"), row.names = FALSE)
+
+# ---- 18. Sex-by-age amplitude sensitivity (Table S2B) ----
+write.csv(as.data.frame(summary(emm_sexage_rhr)),
+          file.path(csv_dir, "amplitude_sex_by_age_RHR.csv"), row.names = FALSE)
+write.csv(as.data.frame(summary(emm_sexage_hrv)),
+          file.path(csv_dir, "amplitude_sex_by_age_HRV.csv"), row.names = FALSE)
+write.csv(bind_rows(
+  as.data.frame(pairs(emm_sexage_rhr)) %>% mutate(Outcome = "RHR"),
+  as.data.frame(pairs(emm_sexage_hrv)) %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_sex_by_age_contrasts.csv"), row.names = FALSE)
+
+# ---- 19a. City-level sensitivity (Table S6) ----
+write.csv(city_sens_results, file.path(csv_dir, "city_sensitivity_tableS6.csv"), row.names = FALSE)
+
+# ---- 19. Amplitude by decade of age (Table S1B) ----
+write.csv(bind_rows(
+  as.data.frame(summary(emm_decade_rhr)) %>% mutate(Outcome = "RHR"),
+  as.data.frame(summary(emm_decade_hrv)) %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_decade.csv"), row.names = FALSE)
+write.csv(bind_rows(
+  as.data.frame(contrast(emm_decade_rhr, "poly")) %>% dplyr::filter(contrast == "linear") %>% mutate(Outcome = "RHR"),
+  as.data.frame(contrast(emm_decade_hrv, "poly")) %>% dplyr::filter(contrast == "linear") %>% mutate(Outcome = "HRV")),
+  file.path(csv_dir, "amplitude_by_decade_trend.csv"), row.names = FALSE)
 
 cat("All results CSVs saved to:", csv_dir, "\n")
 ```
